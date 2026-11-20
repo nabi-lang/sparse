@@ -1,0 +1,93 @@
+//! Restarted GMRES with right preconditioning (Saad and Schultz 1986;
+//! Saad, Iterative Methods for Sparse Linear Systems, alg. 9.5): modified
+//! Gram-Schmidt Arnoldi, Givens rotations on the Hessenberg matrix, so
+//! the residual norm of every step is known without forming `x`.
+
+use pkg::iterative::{Solution, finish, residual, start};
+use pkg::kernel::{apply, axpy, dot, nrm2, precondition};
+use pkg::operator::Operator;
+use pkg::precond::Identity;
+use pkg::{Preconditioner, SparseError};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// Solve `A x = b` for any square nonsingular `A` by GMRES(`restart`):
+/// minimizes `||b - A x||` over a Krylov space of up to `restart`
+/// vectors, then starts again from the best `x`. Never breaks down;
+/// memory `restart * n`, step `k` costs O(k n) plus one `A x` and one
+/// `pre`. Right preconditioning, so the residual tested is the true one.
+///
+/// ```nabi
+/// // Convection-diffusion: not symmetric, so not for cg.
+/// let a = try sparse::diags([[3.0], [-1.5], [-0.5]], [0, 1, -1], [50, 50]);
+/// let s = try sparse::gmres(a, List::filled(50, 1.0), restart: 10);
+/// assert(s.residual <= 1e-8 * 50.0.sqrt());
+/// ```
+pub fn gmres<A: Operator, X: AsVector<f64>>(a: A, b: X, pre: any Preconditioner = Identity {}, x0: Vector<f64> | none = none, rtol: f64 = 1e-8, atol: f64 = 0.0, restart: usize = 30, max_iter: usize | none = none) throws (SparseError) -> Solution {
+    let bv: Vector<f64> = b.as_vector();
+    let s = try start(a, bv, x0, rtol, atol, max_iter);
+    if restart == 0 { throw SparseError::ShapeMismatch { what: "restart 0; pass a Krylov space size of at least 1 (default 30)" }; }
+    let n = s.n;
+    let m = restart.min(n.max(1));
+    let x = s.x;
+    let steps = 0usize;
+    // h is (m + 1) x m, column-major: h[j * (m + 1) + i].
+    let h = List::filled((m + 1) * m, 0.0);
+    let cs = List::filled(m, 0.0);
+    let sn = List::filled(m, 0.0);
+    let g = List::filled(m + 1, 0.0);
+    while steps < s.max_iter {
+        let r = try residual(a, s.b, x);
+        let beta = nrm2(r);
+        if beta <= s.tol { return try finish(a, s, steps); }
+        let v: List<List<f64>> = [List::from_fn(n, |i| r[i] / beta)];
+        for i in 0..m + 1 { g[i] = 0.0; }
+        g[0] = beta;
+        let k = 0usize;
+        let done = false;
+        while k < m && steps < s.max_iter {
+            let w = try apply(a, try precondition(pre, v[k]));
+            for i in 0..k + 1 {
+                let hik = dot(w, v[i]);
+                h[k * (m + 1) + i] = hik;
+                axpy(-hik, v[i], w);
+            }
+            let hn = nrm2(w);
+            h[k * (m + 1) + k + 1] = hn;
+            for i in 0..k {
+                let (a0, a1) = (h[k * (m + 1) + i], h[k * (m + 1) + i + 1]);
+                h[k * (m + 1) + i] = cs[i] * a0 + sn[i] * a1;
+                h[k * (m + 1) + i + 1] = -sn[i] * a0 + cs[i] * a1;
+            }
+            let (p, q) = (h[k * (m + 1) + k], h[k * (m + 1) + k + 1]);
+            let d = p.hypot(q);
+            if d == 0.0 { throw SparseError::Singular { column: k }; }
+            cs[k] = p / d;
+            sn[k] = q / d;
+            h[k * (m + 1) + k] = d;
+            h[k * (m + 1) + k + 1] = 0.0;
+            g[k + 1] = -sn[k] * g[k];
+            g[k] = cs[k] * g[k];
+            k += 1;
+            steps += 1;
+            if g[k].abs() <= s.tol || hn == 0.0 {
+                done = true;
+                break;
+            }
+            v.push(List::from_fn(n, |i| w[i] / hn));
+        }
+        // y = H^-1 g by back substitution, x += M^-1 V y.
+        let y = List::filled(k, 0.0);
+        for t in 0..k {
+            let i = k - 1 - t;
+            let acc = g[i];
+            for j in i + 1..k { acc -= h[j * (m + 1) + i] * y[j]; }
+            y[i] = acc / h[i * (m + 1) + i];
+        }
+        let u = List::filled(n, 0.0);
+        for j in 0..k { axpy(y[j], v[j], u); }
+        axpy(1.0, try precondition(pre, u), x);
+        if done { return try finish(a, s, steps); }
+    }
+    try finish(a, s, steps)
+}

@@ -1,0 +1,101 @@
+use pkg::tests::suite::{dense, poisson2, poisson3, random, rel, rvec, tri};
+use pkg::{Order, SparseError};
+use core::array::Vector;
+
+#[test]
+fn cholesky_poisson() {
+    for a in [poisson2(15), poisson3(6), tri(50, 2.0)] {
+        let n = a.shape()[0];
+        let b = rvec(n, n as u64);
+        for order in [Order::Natural, Order::Rcm, Order::MinDegree] {
+            let f = try! pkg::cholesky(a, order: order);
+            let x = try! f.solve(b);
+            assert(rel(a, x, b) <= 1e-13);
+            // L L^T reproduces P A P^T.
+            let l = f.l().to_dense();
+            let p = f.perm();
+            let llt = try! linalg::matmul(l, l.t());
+            let d = dense(a);
+            for i in 0..n {
+                for j in 0..n { assert((llt[i, j] - d[p[i], p[j]]).abs() <= 1e-12); }
+            }
+        }
+    }
+}
+
+#[test]
+fn ordering_reduces_fill() {
+    let a = poisson2(30);
+    let nat = try! pkg::cholesky(a, order: Order::Natural);
+    let md = try! pkg::cholesky(a);
+    let rc = try! pkg::cholesky(a, order: Order::Rcm);
+    assert(md.nnz() < nat.nnz());
+    assert(rc.nnz() <= nat.nnz());
+    let lu_nat = try! pkg::lu(a, order: Order::Natural);
+    let lu_md = try! pkg::lu(a);
+    assert(lu_md.nnz() < lu_nat.nnz());
+}
+
+#[test]
+fn cholesky_logdet_and_errors() {
+    let a = tri(6, 2.0);
+    // det of tridiag(-1, 2, -1) of order n is n + 1.
+    assert(((try! pkg::cholesky(a)).logdet() - 7.0.ln()).abs() < 1e-13);
+    assert(try { _ = try pkg::cholesky(tri(6, -2.0)); false } catch e: SparseError { e == SparseError::NotPositiveDefinite { column: 0 } || f"{e:?}".starts_with("NotPositiveDefinite") });
+    let u = try! pkg::diags([[2.0], [1.0]], [0, 1], [3, 3]);
+    assert(try { _ = try pkg::cholesky(u); false } catch e: SparseError { f"{e:?}".starts_with("NotSymmetric") });
+}
+
+#[test]
+fn lu_random() {
+    for seed in 1u64..8 {
+        let a = random(80, 80, 4, 0.0, seed);
+        let b = rvec(80, seed);
+        let f = try {
+            try pkg::lu(a, pivot_tol: 1.0)
+        } catch _: SparseError {
+            continue;
+        };
+        let x = try! f.solve(b);
+        assert(rel(a, x, b) <= 1e-10);
+        // P A Q = L U.
+        let lu = try! linalg::matmul(f.l().to_dense(), f.u().to_dense());
+        let (p, q, d) = (f.p(), f.q(), dense(a));
+        for i in 0..80 {
+            for j in 0..80 { assert((lu[i, j] - d[p[i], q[j]]).abs() <= 1e-11); }
+        }
+        let dd = try! linalg::det(d);
+        assert((f.det() - dd).abs() <= 1e-9 * dd.abs().max(1.0));
+    }
+}
+
+#[test]
+fn lu_needs_pivoting() {
+    // A zero diagonal: the pivot must come from another row.
+    let a = try! pkg::Csr::from_triplets([3, 3], [0, 0, 1, 1, 2, 2], [1, 2, 0, 2, 0, 1], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let b: Vector<f64> = [3, 7, 11];
+    let x = try! (try! pkg::lu(a)).solve(b);
+    assert(rel(a, x, b) <= 1e-14);
+    assert(try { _ = try pkg::lu(try! pkg::diags([[1.0, 0.0, 1.0]], [0], [3, 3])); false } catch e: SparseError { f"{e:?}".starts_with("Singular") });
+    assert(try { _ = try pkg::lu(random(3, 4, 2, 0.0, 1)); false } catch e: SparseError { f"{e:?}".starts_with("NotSquare") });
+    let f = try! pkg::lu(a);
+    assert(try { _ = try f.solve([1.0]); false } catch e: SparseError { f"{e:?}".starts_with("ShapeMismatch") });
+}
+
+#[test]
+fn cholesky_random_spd() {
+    // R^T R + I for seeded random sparse R: SPD with a scattered pattern.
+    for seed in 1u64..6 {
+        let r = random(60, 60, 3, 0.0, seed);
+        let a = (try! r.t().to_csr().matmul(r)) + pkg::eye(60);
+        let b = rvec(60, seed + 7);
+        for order in [Order::Natural, Order::Rcm, Order::MinDegree] {
+            let x = try! (try! pkg::cholesky(a, order: order)).solve(b);
+            assert(rel(a, x, b) <= 1e-12);
+        }
+        let s = try! pkg::cg(a, b, pre: try! pkg::Jacobi::new(a), rtol: 1e-10);
+        assert(rel(a, s.x, b) <= 2e-10);
+        let want = try! linalg::solve(dense(a), b);
+        assert(s.x.all_close(want, rel: 1e-7, abs: 1e-9));
+    }
+}

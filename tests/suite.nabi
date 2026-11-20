@@ -1,0 +1,71 @@
+// Tests: small exact cases, round trips between the forms and dense,
+// Poisson systems in 2-d and 3-d solved every way, residual checks on
+// seeded random matrices, edge cases and the operators.
+
+mod direct;
+mod forms;
+mod iterative;
+#[cfg(feature = "ops")]
+mod ops;
+mod order;
+mod product;
+
+use pkg::Csr;
+use core::array::{Array, Matrix, Vector};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+/// The 1-d Laplacian `tridiag(-1, d, -1)` of order `n`.
+pub fn tri(n: usize, d: f64) -> Csr { try! pkg::diags([[d], [-1.0], [-1.0]], [0, 1, -1], [n, n]) }
+
+/// The 2-d five-point Laplacian on an `n x n` grid (order `n^2`).
+pub fn poisson2(n: usize) -> Csr {
+    let t = tri(n, 2.0);
+    let i = pkg::eye(n);
+    pkg::kron(i, t) + pkg::kron(t, i)
+}
+
+/// The 3-d seven-point Laplacian on an `n^3` grid.
+pub fn poisson3(n: usize) -> Csr {
+    let t = tri(n, 2.0);
+    let i = pkg::eye(n);
+    let ii = pkg::kron(i, i);
+    pkg::kron(ii, t) + pkg::kron(pkg::kron(i, t), i) + pkg::kron(t, ii)
+}
+
+/// A random `m x n` matrix with about `per_row` entries a row in
+/// [-1, 1), plus `shift` on the diagonal.
+pub fn random(m: usize, n: usize, per_row: usize, shift: f64, seed: u64) -> Csr {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    let (r, c, v): (List<usize>, List<usize>, List<f64>) = ([], [], []);
+    for i in 0..m {
+        for _ in 0..per_row {
+            r.push(i);
+            c.push(g.range(0..n));
+            v.push(g.uniform(-1.0, 1.0));
+        }
+        if i < n && shift != 0.0 {
+            r.push(i);
+            c.push(i);
+            v.push(shift);
+        }
+    }
+    try! Csr::from_triplets([m, n], r, c, v)
+}
+
+/// A random vector of uniform values in [-1, 1).
+pub fn rvec(n: usize, seed: u64) -> Vector<f64> {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    let xs: List<f64> = List::with_capacity(n);
+    for _ in 0..n { xs.push(g.uniform(-1.0, 1.0)); }
+    arr(xs)
+}
+
+/// `||A x - b|| / ||b||`.
+pub fn rel(a: Csr, x: Vector<f64>, b: Vector<f64>) -> f64 {
+    let r = (try! a.matvec(x)) .- b;
+    ((r .* r).sum() / (b .* b).sum()).sqrt()
+}
+
+pub fn dense(a: Csr) -> Matrix<f64> { a.to_dense() }
+
+pub fn arr(xs: List<f64>) -> Vector<f64> { Array::view_list(xs, [xs.len()]) }

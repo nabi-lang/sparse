@@ -1,0 +1,18 @@
+Package {
+    name: "sparse",
+    version: "0.1.0",
+    nabi_version: "0.1.0",
+    toolchain: "0.1",
+    description: "Sparse matrices on core arrays: CSR, CSC, COO, products, CG, GMRES, BiCGSTAB with preconditioners, sparse Cholesky and LU",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/nabi-lang/sparse",
+    keywords: ["sparse", "matrix", "linear-algebra", "iterative-solvers", "numerics"],
+    categories: ["mathematics", "science"],
+    deps: {
+        "linalg": Dep::path("../linalg", version: "^0.1"),
+    },
+    features: {
+        "default": ["ops"],
+        "ops": [],
+    },
+}

@@ -1,0 +1,51 @@
+//! Direct sparse factorizations: `cholesky` for symmetric positive
+//! definite matrices, `lu` for any square nonsingular one. Both order
+//! the unknowns first (`Order`) to keep the factors sparse, and solve
+//! as many right-hand sides as needed afterwards.
+
+mod general;
+mod symmetric;
+
+pub use pkg::direct::general::{Lu, lu};
+pub use pkg::direct::symmetric::{Cholesky, cholesky};
+
+use pkg::SparseError;
+use pkg::csr::vector;
+use core::array::Vector;
+use linalg::AsVector;
+
+/// `b` as a checked list of length `n`.
+pub(pkg) fn rhs<X: AsVector<f64>>(b: X, n: usize) throws (SparseError) -> List<f64> {
+    let v: Vector<f64> = b.as_vector();
+    if v.len() != n { throw pkg::error::mismatch("solve", f"a {n} x {n} factorization", f"b of {v.len()}"); }
+    let xs = v.as_list() ?? v.to_list();
+    try pkg::error::finite(xs);
+    xs
+}
+
+/// The inverse of a permutation.
+pub(pkg) fn inverse(p: List<usize>) -> List<usize> {
+    let q = List::filled(p.len(), 0usize);
+    for i in 0..p.len() { q[p[i]] = i; }
+    q
+}
+
+/// `+1.0` or `-1.0`: the parity of a permutation, by its cycles.
+pub(pkg) fn parity(p: List<usize>) -> f64 {
+    let seen = List::filled(p.len(), false);
+    let s = 1.0;
+    for i in 0..p.len() {
+        if seen[i] { continue; }
+        let j = i;
+        let len = 0usize;
+        while !seen[j] {
+            seen[j] = true;
+            j = p[j];
+            len += 1;
+        }
+        if len % 2 == 0 { s = -s; }
+    }
+    s
+}
+
+pub(pkg) fn out(x: List<f64>) -> Vector<f64> { vector(x) }

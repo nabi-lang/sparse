@@ -1,0 +1,95 @@
+use pkg::tests::suite::{poisson2, poisson3, random, rel, rvec, tri};
+use pkg::{Jacobi, SparseError};
+use core::array::Vector;
+
+#[test]
+fn cg_poisson() {
+    let a = poisson2(20);
+    let b = rvec(400, 1);
+    let plain = try! pkg::cg(a, b);
+    assert(rel(a, plain.x, b) <= 2e-8);
+    let j = try! pkg::cg(a, b, pre: try! Jacobi::new(a));
+    assert(rel(a, j.x, b) <= 2e-8);
+    let ic = try! pkg::cg(a, b, pre: try! pkg::ic0(a));
+    assert(rel(a, ic.x, b) <= 2e-8);
+    assert(ic.iterations < plain.iterations);
+    // Unpreconditioned CG on the 2-d Laplacian needs O(n) steps here,
+    // well under the size of the system.
+    assert(plain.iterations < 100);
+    let exact = try! pkg::cg(a, b, pre: try! pkg::cholesky(a));
+    assert(exact.iterations <= 2);
+}
+
+#[test]
+fn cg_3d_and_start() {
+    let a = poisson3(8);
+    let b = Vector::<f64>::ones([512]);
+    let s = try! pkg::cg(a, b, rtol: 1e-12);
+    assert(rel(a, s.x, b) <= 2e-12);
+    let again = try! pkg::cg(a, b, x0: s.x, rtol: 1e-10);
+    assert(again.iterations == 0);
+    let loose = try! pkg::cg(a, b, rtol: 1e-3);
+    assert(loose.iterations < s.iterations);
+}
+
+#[test]
+fn gmres_and_bicgstab_nonsymmetric() {
+    for seed in 1u64..5 {
+        let a = random(120, 120, 5, 6.0, seed);
+        let b = rvec(120, seed + 10);
+        let g = try! pkg::gmres(a, b);
+        assert(rel(a, g.x, b) <= 2e-8);
+        let g5 = try! pkg::gmres(a, b, restart: 5, max_iter: 5000);
+        assert(rel(a, g5.x, b) <= 2e-8);
+        let gi = try! pkg::gmres(a, b, pre: try! pkg::ilu0(a));
+        assert(rel(a, gi.x, b) <= 2e-8 && gi.iterations <= g.iterations);
+        let s = try! pkg::bicgstab(a, b);
+        assert(rel(a, s.x, b) <= 2e-8);
+        let si = try! pkg::bicgstab(a, b, pre: try! pkg::ilu0(a));
+        assert(rel(a, si.x, b) <= 2e-8);
+        let gl = try! pkg::gmres(a, b, pre: try! pkg::lu(a));
+        assert(gl.iterations <= 2);
+    }
+}
+
+#[test]
+fn matrix_free_and_dense() {
+    let n = 64;
+    let lap = pkg::operator(n, |x: Vector<f64>| -> Vector<f64> {
+        Vector::<f64>::from_fn([n], |i: [usize; 1]| -> f64 {
+            let k = i[0];
+            2.0 * x[k] - (if k > 0 { x[k - 1] } else { 0.0 }) - (if k + 1 < n { x[k + 1] } else { 0.0 })
+        })
+    });
+    let b = Vector::<f64>::ones([n]);
+    let s = try! pkg::cg(lap, b);
+    let t = try! pkg::cg(tri(n, 2.0), b);
+    assert(s.x.all_close(t.x, rel: 1e-6));
+    let d = try! pkg::gmres(tri(n, 2.0).to_dense(), b);
+    assert(d.x.all_close(t.x, rel: 1e-6));
+    let c = try! pkg::bicgstab(tri(n, 2.0).to_csc(), b);
+    assert(c.x.all_close(t.x, rel: 1e-6));
+}
+
+#[test]
+fn errors() {
+    let a = tri(10, 2.0);
+    let b = Vector::<f64>::ones([10]);
+    let kind = |f: fn() throws (SparseError), want: str| -> bool {
+        try { f(); false } catch e: SparseError { f"{e:?}".starts_with(want) }
+    };
+    assert(kind(|| { _ = try pkg::cg(a, b, max_iter: 2); }, "NoConvergence"));
+    assert(kind(|| { _ = try pkg::cg(a, [1.0, 2.0]); }, "ShapeMismatch"));
+    assert(kind(|| { _ = try pkg::cg(a, b .* f64::NAN); }, "NotFinite"));
+    assert(kind(|| { _ = try pkg::cg(tri(10, -2.0), b); }, "NotPositiveDefinite"));
+    assert(kind(|| { _ = try pkg::gmres(pkg::kron(pkg::eye(1), random(3, 4, 2, 0.0, 1)), b); }, "NotSquare"));
+    assert(kind(|| { _ = try pkg::gmres(a, b, restart: 0); }, "ShapeMismatch"));
+    assert(kind(|| { _ = try pkg::ic0(tri(10, 0.5)); }, "NotPositiveDefinite"));
+    assert(kind(|| { _ = try pkg::ilu0(try! pkg::diags([[0.0, 1.0]], [0], [2, 2])); }, "Singular"));
+    assert(kind(|| { _ = try Jacobi::new(try! pkg::diags([[1.0, 0.0]], [0], [2, 2])); }, "Singular"));
+    let bad = pkg::operator(10, |x: Vector<f64>| -> Vector<f64> { x[0:3].copy() });
+    assert(kind(|| { _ = try pkg::cg(bad, b); }, "ShapeMismatch"));
+    // b = 0 gives x = 0 at once.
+    let z = try! pkg::gmres(a, Vector::<f64>::zeros([10]));
+    assert(z.iterations == 0 && z.x.all_close(Vector::<f64>::zeros([10])));
+}

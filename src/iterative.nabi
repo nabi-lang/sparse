@@ -1,0 +1,84 @@
+//! Krylov solvers for `A x = b`: `cg` (symmetric positive definite),
+//! `gmres` (any square `A`, restarted), `bicgstab` (any square `A`, short
+//! recurrences). Each stops when `||b - A x|| <= max(rtol ||b||, atol)`
+//! and throws `NoConvergence` after `max_iter` steps (default `10 n`).
+
+mod arnoldi;
+mod conjugate;
+mod stabilized;
+
+pub use pkg::iterative::arnoldi::gmres;
+pub use pkg::iterative::conjugate::cg;
+pub use pkg::iterative::stabilized::bicgstab;
+
+use pkg::kernel::{apply, list, nrm2};
+use pkg::operator::Operator;
+use pkg::{SparseError, error};
+use core::array::Vector;
+
+/// What an iterative solver found: `x`, the steps it took (`gmres`:
+/// inner steps over all restarts) and the final residual norm `||b - A
+/// x||`, computed afresh.
+///
+/// ```nabi
+/// let a = try sparse::diags([[2.0], [-1.0], [-1.0]], [0, 1, -1], [10, 10]);
+/// let s = try sparse::cg(a, List::filled(10, 1.0));
+/// assert(s.iterations <= 10 && s.residual <= 1e-8 * 10.0.sqrt());
+/// println(s.x);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Solution {
+    /// The solution.
+    pub x: Vector<f64>;
+    /// The number of steps taken.
+    pub iterations: usize;
+    /// `||b - A x||`.
+    pub residual: f64;
+}
+
+/// The checked start of a solve: `b`, `x` (a fresh copy of `x0` or
+/// zeros), the stopping threshold and the step limit.
+pub(pkg) struct Start {
+    pub(pkg) n: usize;
+    pub(pkg) b: List<f64>;
+    pub(pkg) x: List<f64>;
+    pub(pkg) tol: f64;
+    pub(pkg) max_iter: usize;
+}
+
+pub(pkg) fn start<A: Operator>(a: A, b: Vector<f64>, x0: Vector<f64> | none, rtol: f64, atol: f64, max_iter: usize | none) throws (SparseError) -> Start {
+    let d = a.dims();
+    try error::square(d[0], d[1]);
+    let n = d[0];
+    if b.len() != n { throw error::mismatch("solve", f"a {n} x {n} operator", f"b of {b.len()}"); }
+    let bs = list(b);
+    try error::finite(bs);
+    let x = if let v: Vector<f64> = x0 {
+        if v.len() != n { throw error::mismatch("solve", f"a {n} x {n} operator", f"x0 of {v.len()}"); }
+        v.to_list()
+    } else {
+        List::filled(n, 0.0)
+    };
+    try error::finite(x);
+    if !(rtol >= 0.0) || !(atol >= 0.0) {
+        throw SparseError::ShapeMismatch { what: f"tolerances rtol {rtol} and atol {atol}; pass values >= 0" };
+    }
+    Start { n, b: bs, x, tol: (rtol * nrm2(bs)).max(atol), max_iter: max_iter ?? 10 * n.max(1) }
+}
+
+/// `b - A x`.
+pub(pkg) fn residual<A: Operator>(a: A, b: List<f64>, x: List<f64>) throws (SparseError) -> List<f64> {
+    let ax = try apply(a, x);
+    List::from_fn(b.len(), |i| b[i] - ax[i])
+}
+
+/// The solution with a fresh residual, or `NoConvergence`.
+pub(pkg) fn finish<A: Operator>(a: A, s: Start, iterations: usize) throws (SparseError) -> Solution {
+    let r = nrm2(try residual(a, s.b, s.x));
+    // The recurrences drift from the true residual by rounding; allow
+    // for it in the final check.
+    if !(r <= s.tol * 2.0 + 1e-14 * nrm2(s.b)) {
+        throw SparseError::NoConvergence { iterations, residual: r };
+    }
+    Solution { x: pkg::csr::vector(s.x), iterations, residual: r }
+}

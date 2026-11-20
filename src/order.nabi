@@ -1,0 +1,234 @@
+//! Fill-reducing orderings on the graph of `A + A^T`: reverse
+//! Cuthill-McKee (small bandwidth) and minimum degree (little fill).
+
+use pkg::compress::Cs;
+use pkg::{Sparse, SparseError};
+
+/// How a direct factorization orders the unknowns before eliminating.
+///
+/// ```nabi
+/// use sparse::Order;
+///
+/// let a = try sparse::diags([[4.0], [-1.0], [-1.0]], [0, 1, -1], [5, 5]);
+/// let f = try sparse::cholesky(a, order: Order::Natural);
+/// assert(f.perm() == [0, 1, 2, 3, 4]);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Order {
+    /// As given.
+    Natural,
+    /// Reverse Cuthill-McKee: a small bandwidth, quick to compute.
+    Rcm,
+    /// Minimum degree: the least fill of the three on most problems
+    /// (the default).
+    MinDegree,
+}
+
+/// The symmetric adjacency of `A + A^T` without the diagonal.
+pub(pkg) fn graph(s: Cs) -> List<List<usize>> {
+    let n = s.major;
+    let t = s.transpose();
+    let adj: List<List<usize>> = List::from_fn(n, |_| -> List<usize> { [] });
+    let mark = List::filled(n, usize::MAX);
+    for k in 0..n {
+        mark[k] = k;
+        for p in s.ptr[k]..s.ptr[k + 1] {
+            let j = s.idx[p];
+            if mark[j] != k {
+                mark[j] = k;
+                adj[k].push(j);
+            }
+        }
+        for p in t.ptr[k]..t.ptr[k + 1] {
+            let j = t.idx[p];
+            if mark[j] != k {
+                mark[j] = k;
+                adj[k].push(j);
+            }
+        }
+    }
+    adj
+}
+
+/// The permutation `p` (new position `i` holds old index `p[i]`) for
+/// `order` on a square `s`.
+pub(pkg) fn permutation(s: Cs, order: Order) -> List<usize> {
+    match order {
+        Order::Natural => List::from_fn(s.major, |i| i),
+        Order::Rcm => cuthill(graph(s)),
+        Order::MinDegree => degree(graph(s)),
+    }
+}
+
+/// The reverse Cuthill-McKee order of a square `a`: breadth-first from a
+/// pseudo-peripheral vertex (George and Liu 1979) of each component,
+/// neighbours by rising degree, then reversed. O(nnz log).
+///
+/// ```nabi
+/// let a = try sparse::diags([[2.0], [-1.0], [-1.0]], [0, 3, -3], [6, 6]);
+/// let p = try sparse::rcm(a);
+/// assert(p.len() == 6);
+/// ```
+pub fn rcm<S: Sparse>(a: S) throws (SparseError) -> List<usize> {
+    let c = a.as_csr();
+    try pkg::error::square(c.s.major, c.s.minor);
+    cuthill(graph(c.s))
+}
+
+/// The minimum degree order of a square `a`: eliminate a vertex of the
+/// fewest neighbours in the elimination graph, then join its neighbours
+/// (Tinney and Walker 1967, on the explicit graph, without AMD's
+/// approximate degrees or supervariables: exact, slower on big 3-d
+/// problems).
+///
+/// ```nabi
+/// let t = try sparse::diags([[4.0], [-1.0], [-1.0]], [0, 1, -1], [4, 4]);
+/// let a = try sparse::kron(sparse::eye(4), t).add(sparse::kron(t, sparse::eye(4)));
+/// let p = try sparse::min_degree(a);
+/// assert(p.len() == 16 && p[0] == 0);   // a corner has the fewest neighbours
+/// ```
+pub fn min_degree<S: Sparse>(a: S) throws (SparseError) -> List<usize> {
+    let c = a.as_csr();
+    try pkg::error::square(c.s.major, c.s.minor);
+    degree(graph(c.s))
+}
+
+fn cuthill(adj: List<List<usize>>) -> List<usize> {
+    let n = adj.len();
+    let seen = List::filled(n, false);
+    let order: List<usize> = List::with_capacity(n);
+    let level = List::filled(n, 0usize);
+    for s0 in 0..n {
+        if seen[s0] { continue; }
+        let root = peripheral(adj, s0, level);
+        seen[root] = true;
+        let head = order.len();
+        order.push(root);
+        while head < order.len() {
+            let v = order[head];
+            head += 1;
+            let nb: List<usize> = [];
+            for u in adj[v] {
+                if !seen[u] {
+                    seen[u] = true;
+                    nb.push(u);
+                }
+            }
+            nb.sort_by_key(|u: usize| -> usize { adj[u].len() });
+            for u in nb { order.push(u); }
+        }
+    }
+    order.reverse();
+    order
+}
+
+/// A vertex of the component of `s` far from the rest: repeat a
+/// breadth-first search from a last-level vertex of least degree while
+/// the depth grows.
+fn peripheral(adj: List<List<usize>>, s: usize, level: List<usize>) -> usize {
+    let root = s;
+    let depth = 0usize;
+    loop {
+        let (d, far) = bfs(adj, root, level);
+        if d <= depth && depth > 0 { return root; }
+        depth = d;
+        if far == root { return root; }
+        root = far;
+        if depth == 0 { return root; }
+    }
+}
+
+/// Depth of the breadth-first tree from `r` and a last-level vertex of
+/// least degree.
+fn bfs(adj: List<List<usize>>, r: usize, level: List<usize>) -> (usize, usize) {
+    let q: List<usize> = [r];
+    level[r] = 0;
+    let mark: List<bool> = List::filled(adj.len(), false);
+    mark[r] = true;
+    let head = 0usize;
+    while head < q.len() {
+        let v = q[head];
+        head += 1;
+        for u in adj[v] {
+            if !mark[u] {
+                mark[u] = true;
+                level[u] = level[v] + 1;
+                q.push(u);
+            }
+        }
+    }
+    let d = level[q[q.len() - 1]];
+    let best = q[q.len() - 1];
+    for v in q {
+        if level[v] == d && adj[v].len() < adj[best].len() { best = v; }
+    }
+    (d, best)
+}
+
+fn degree(adj: List<List<usize>>) -> List<usize> {
+    let n = adj.len();
+    let none_ = usize::MAX;
+    // Doubly linked buckets by degree.
+    let head = List::filled(n + 1, none_);
+    let next = List::filled(n, none_);
+    let prev = List::filled(n, none_);
+    let deg = List::from_fn(n, |v| adj[v].len());
+    let gone = List::filled(n, false);
+    let mark = List::filled(n, usize::MAX);
+    let insert = |v: usize| {
+        let d = deg[v];
+        next[v] = head[d];
+        prev[v] = none_;
+        if head[d] != none_ { prev[head[d]] = v; }
+        head[d] = v;
+    };
+    let remove = |v: usize| {
+        if prev[v] != none_ { next[prev[v]] = next[v]; } else { head[deg[v]] = next[v]; }
+        if next[v] != none_ { prev[next[v]] = prev[v]; }
+    };
+    for v in 0..n {
+        let u = n - 1 - v;
+        insert(u);
+    }
+    let order: List<usize> = List::with_capacity(n);
+    let low = 0usize;
+    for step in 0..n {
+        while head[low] == none_ { low += 1; }
+        let v = head[low];
+        remove(v);
+        gone[v] = true;
+        order.push(v);
+        let nv = adj[v];
+        let nn = nv.len();
+        for t in 0..nn {
+            let u = nv[t];
+            remove(u);
+            // adj[u] := adj[u] + adj[v] - {u, v}, in place.
+            let au = adj[u];
+            let k = 0usize;
+            for r in 0..au.len() {
+                let w = au[r];
+                if w != v && !gone[w] && mark[w] != step {
+                    mark[w] = step;
+                    au[k] = w;
+                    k += 1;
+                }
+            }
+            au.truncate(k);
+            for r in 0..nn {
+                let w = nv[r];
+                if w != u && mark[w] != step {
+                    mark[w] = step;
+                    au.push(w);
+                }
+            }
+            // Clear the marks so the next neighbour starts fresh.
+            for r in 0..au.len() { mark[au[r]] = usize::MAX; }
+            deg[u] = au.len();
+            insert(u);
+            if deg[u] < low { low = deg[u]; }
+        }
+        adj[v] = [];
+    }
+    order
+}

@@ -1,0 +1,89 @@
+//! `Coo`, coordinate triplets: the form to assemble a matrix in.
+
+use pkg::compress::Cs;
+use pkg::{Csc, Csr, SparseError};
+use core::array::{Array, Matrix};
+
+/// A sparse matrix as `(row, col, value)` triplets in any order, with
+/// repeats allowed (they add up when converted). Push entries, then
+/// convert once with `to_csr` or `to_csc`.
+///
+/// ```nabi
+/// use sparse::Coo;
+///
+/// let c = Coo::new([3, 3]);
+/// for i in 0..3 { try c.push(i, i, 2.0); }
+/// try c.push(0, 1, -1.0);
+/// try c.push(0, 1, -1.0);
+/// let a = c.to_csr();
+/// assert(a.get(0, 1) == -2.0 && a.nnz() == 4);
+/// ```
+#[derive(Clone)]
+pub struct Coo {
+    pub(pkg) m: usize;
+    pub(pkg) n: usize;
+    pub(pkg) rows: List<usize>;
+    pub(pkg) cols: List<usize>;
+    pub(pkg) vals: List<f64>;
+}
+
+impl Coo {
+    /// An empty `shape` matrix.
+    pub fn new(shape: [usize; 2]) -> Coo { Coo { m: shape[0], n: shape[1], rows: [], cols: [], vals: [] } }
+
+    /// The triplets `(rows[p], cols[p], vals[p])`, checked against
+    /// `shape`.
+    ///
+    /// ```nabi
+    /// let c = try sparse::Coo::from_triplets([2, 2], [0, 1], [1, 0], [1.0, 2.0]);
+    /// assert(c.nnz() == 2 && c.to_dense()[1, 0] == 2.0);
+    /// ```
+    pub fn from_triplets(shape: [usize; 2], rows: List<usize>, cols: List<usize>, vals: List<f64>) throws (SparseError) -> Coo {
+        let n = rows.len();
+        if cols.len() != n || vals.len() != n {
+            throw SparseError::ShapeMismatch { what: f"triplets of {rows.len()} rows, {cols.len()} columns and {vals.len()} values; pass one row, column and value per entry" };
+        }
+        for p in 0..n {
+            if rows[p] >= shape[0] || cols[p] >= shape[1] {
+                throw SparseError::OutOfBounds { what: f"entry {p} at ({rows[p]}, {cols[p]}) in a {shape[0]} x {shape[1]} matrix" };
+            }
+        }
+        Coo { m: shape[0], n: shape[1], rows: rows.clone(), cols: cols.clone(), vals: vals.clone() }
+    }
+
+    /// Add `v` at `(i, j)` (on top of what is there).
+    pub fn push(self, i: usize, j: usize, v: f64) throws (SparseError) {
+        if i >= self.m || j >= self.n { throw SparseError::OutOfBounds { what: f"({i}, {j}) in a {self.m} x {self.n} matrix" }; }
+        self.rows.push(i);
+        self.cols.push(j);
+        self.vals.push(v);
+    }
+
+    /// `[rows, cols]`.
+    pub fn shape(self) -> [usize; 2] { [self.m, self.n] }
+
+    /// The number of triplets (repeats counted).
+    pub fn nnz(self) -> usize { self.vals.len() }
+
+    /// The row of each triplet.
+    pub fn rows(self) -> List<usize> { self.rows }
+
+    /// The column of each triplet.
+    pub fn cols(self) -> List<usize> { self.cols }
+
+    /// The value of each triplet.
+    pub fn vals(self) -> List<f64> { self.vals }
+
+    /// Compressed rows, repeats summed. O(nnz + rows + cols).
+    pub fn to_csr(self) -> Csr { Csr { s: try! Cs::from_triplets(self.m, self.n, self.rows, self.cols, self.vals) } }
+
+    /// Compressed columns, repeats summed.
+    pub fn to_csc(self) -> Csc { Csc { s: try! Cs::from_triplets(self.n, self.m, self.cols, self.rows, self.vals) } }
+
+    /// The dense matrix, repeats summed.
+    pub fn to_dense(self) -> Matrix<f64> {
+        let out = List::filled(self.m * self.n, 0.0);
+        for p in 0..self.vals.len() { out[self.rows[p] * self.n + self.cols[p]] += self.vals[p]; }
+        Array::view_list(out, [self.m, self.n])
+    }
+}

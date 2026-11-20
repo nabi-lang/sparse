@@ -1,0 +1,212 @@
+//! Left-looking sparse LU with threshold partial pivoting (Gilbert and
+//! Peierls 1988; Davis, Direct Methods for Sparse Linear Systems, 2006,
+//! ch. 6): column `k` of `L` and `U` comes from one sparse triangular
+//! solve whose pattern is a depth-first reach in the graph of `L`, so
+//! the whole factorization costs O(flops).
+
+use pkg::compress::Cs;
+use pkg::direct::{inverse, out, parity, rhs};
+use pkg::order::{Order, permutation};
+use pkg::{Csc, Preconditioner, Sparse, SparseError};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// `P A Q = L U` for a sparse square nonsingular `A`. See `lu`.
+#[derive(Clone)]
+pub struct Lu {
+    pub(pkg) n: usize;
+    /// Row `i` of `A` is row `pinv[i]` of `P A`.
+    pub(pkg) pinv: List<usize>;
+    pub(pkg) q: List<usize>;
+    /// Unit lower triangular by columns, the unit first in each.
+    pub(pkg) l: Cs;
+    /// Strictly upper triangular part of `U` by columns.
+    pub(pkg) u: Cs;
+    pub(pkg) d: List<f64>;
+}
+
+/// The sparse LU factorization of a square `a`: the columns in `order`
+/// (default minimum degree on `A + A^T`), rows by threshold partial
+/// pivoting. A diagonal entry is kept as the pivot while it is at least
+/// `pivot_tol` times the column's largest candidate (1.0: plain partial
+/// pivoting, smaller: sparser factors at some cost in stability). No
+/// nonzero pivot throws `Singular`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let a = try sparse::Csr::from_triplets([3, 3], [0, 0, 1, 2, 2], [1, 2, 0, 0, 2], [2.0, 1.0, 3.0, 1.0, 4.0]);
+/// let f = try sparse::lu(a);
+/// let x = try f.solve([3, 3, 5]);
+/// assert(x.all_close(Vector::<f64>::from([1.0, 1.0, 1.0])));
+/// assert((f.det() - (-24.0)).abs() < 1e-12);
+/// ```
+pub fn lu<S: Sparse>(a: S, order: Order = Order::MinDegree, pivot_tol: f64 = 0.1) throws (SparseError) -> Lu {
+    let c = a.as_csc();
+    let sh = c.shape();
+    try pkg::error::square(sh[0], sh[1]);
+    try pkg::error::finite(c.s.val);
+    let n = sh[0];
+    let q = permutation(c.s, order);
+    let none_ = usize::MAX;
+    let pinv = List::filled(n, none_);
+    let (lp, li, lx): (List<usize>, List<usize>, List<f64>) = ([0], [], []);
+    let (up, ui, ux): (List<usize>, List<usize>, List<f64>) = ([0], [], []);
+    let d = List::filled(n, 0.0);
+    let x = List::filled(n, 0.0);
+    let xi = List::filled(n, 0usize);
+    let stack = List::filled(n, 0usize);
+    let pstack = List::filled(n, 0usize);
+    let mark = List::filled(n, none_);
+    let tol = pivot_tol.min(1.0).max(0.0);
+    for k in 0..n {
+        let col = q[k];
+        // The reach of A[:, col] in the graph of L: xi[top..n] in
+        // topological order.
+        let top = n;
+        for p in c.s.ptr[col]..c.s.ptr[col + 1] {
+            let r = c.s.idx[p];
+            if mark[r] == k { continue; }
+            let head = 0usize;
+            stack[0] = r;
+            loop {
+                let j = stack[head];
+                let jn = pinv[j];
+                if mark[j] != k {
+                    mark[j] = k;
+                    pstack[head] = if jn == none_ { 0 } else { lp[jn] + 1 };
+                }
+                let end = if jn == none_ { 0 } else { lp[jn + 1] };
+                let pushed = false;
+                let t = pstack[head];
+                while t < end {
+                    let i = li[t];
+                    t += 1;
+                    if mark[i] == k { continue; }
+                    pstack[head] = t;
+                    head += 1;
+                    stack[head] = i;
+                    pushed = true;
+                    break;
+                }
+                if pushed { continue; }
+                top -= 1;
+                xi[top] = j;
+                if head == 0 { break; }
+                head -= 1;
+            }
+        }
+        // x = L \ A[:, col] on that pattern.
+        for t in top..n { x[xi[t]] = 0.0; }
+        for p in c.s.ptr[col]..c.s.ptr[col + 1] { x[c.s.idx[p]] = c.s.val[p]; }
+        for t in top..n {
+            let j = xi[t];
+            let jn = pinv[j];
+            if jn == none_ { continue; }
+            let xj = x[j];
+            for p in lp[jn] + 1..lp[jn + 1] { x[li[p]] -= lx[p] * xj; }
+        }
+        // U's column from the pivoted rows, the pivot from the others.
+        let (ipiv, big) = (none_, -1.0);
+        for t in top..n {
+            let i = xi[t];
+            if pinv[i] == none_ {
+                let v = x[i].abs();
+                if v > big {
+                    big = v;
+                    ipiv = i;
+                }
+            } else {
+                ui.push(pinv[i]);
+                ux.push(x[i]);
+            }
+        }
+        if ipiv == none_ || !(big > 0.0) { throw SparseError::Singular { column: k }; }
+        if pinv[col] == none_ && mark[col] == k && x[col].abs() >= tol * big { ipiv = col; }
+        let piv = x[ipiv];
+        d[k] = piv;
+        pinv[ipiv] = k;
+        li.push(ipiv);
+        lx.push(1.0);
+        for t in top..n {
+            let i = xi[t];
+            if pinv[i] == none_ {
+                li.push(i);
+                lx.push(x[i] / piv);
+            }
+            x[i] = 0.0;
+        }
+        lp.push(li.len());
+        up.push(ui.len());
+    }
+    for p in 0..li.len() { li[p] = pinv[li[p]]; }
+    Lu { n, pinv, q, l: Cs { major: n, minor: n, ptr: lp, idx: li, val: lx }, u: Cs { major: n, minor: n, ptr: up, idx: ui, val: ux }, d }
+}
+
+impl Lu {
+    /// `x` with `A x = b`: two triangular solves, O(|L| + |U|).
+    pub fn solve<X: AsVector<f64>>(self, b: X) throws (SparseError) -> Vector<f64> {
+        let bs = try rhs(b, self.n);
+        out(self.apply(bs))
+    }
+
+    pub(pkg) fn apply(self, bs: List<f64>) -> List<f64> {
+        let n = self.n;
+        let (l, u) = (self.l, self.u);
+        let y = List::filled(n, 0.0);
+        for i in 0..n { y[self.pinv[i]] = bs[i]; }
+        for j in 0..n {
+            let yj = y[j];
+            for p in l.ptr[j] + 1..l.ptr[j + 1] { y[l.idx[p]] -= l.val[p] * yj; }
+        }
+        for t in 0..n {
+            let j = n - 1 - t;
+            y[j] /= self.d[j];
+            let yj = y[j];
+            for p in u.ptr[j]..u.ptr[j + 1] { y[u.idx[p]] -= u.val[p] * yj; }
+        }
+        let x = List::filled(n, 0.0);
+        for k in 0..n { x[self.q[k]] = y[k]; }
+        x
+    }
+
+    /// `L`: unit lower triangular, of `P A Q`.
+    pub fn l(self) -> Csc { Csc { s: self.l.transpose().transpose() } }
+
+    /// `U`: upper triangular, of `P A Q`.
+    pub fn u(self) -> Csc {
+        let (r, c, v): (List<usize>, List<usize>, List<f64>) = ([], [], []);
+        for j in 0..self.n {
+            for p in self.u.ptr[j]..self.u.ptr[j + 1] {
+                r.push(self.u.idx[p]);
+                c.push(j);
+                v.push(self.u.val[p]);
+            }
+            r.push(j);
+            c.push(j);
+            v.push(self.d[j]);
+        }
+        Csc { s: try! Cs::from_triplets(self.n, self.n, c, r, v) }
+    }
+
+    /// The row order: row `k` of `P A` is row `p()[k]` of `A`.
+    pub fn p(self) -> List<usize> { inverse(self.pinv) }
+
+    /// The column order: column `k` of `A Q` is column `q()[k]` of `A`.
+    pub fn q(self) -> List<usize> { self.q }
+
+    /// The number of stored entries of `L` and `U` together.
+    pub fn nnz(self) -> usize { self.l.nnz() + self.u.nnz() + self.n }
+
+    /// `det A`: the product of `U`'s diagonal and the signs of both
+    /// permutations.
+    pub fn det(self) -> f64 {
+        let s = parity(self.pinv) * parity(self.q);
+        for j in 0..self.n { s *= self.d[j]; }
+        s
+    }
+}
+
+impl Preconditioner for Lu {
+    fn precondition(self, r: Vector<f64>) -> Vector<f64> { out(self.apply(r.as_list() ?? r.to_list())) }
+}

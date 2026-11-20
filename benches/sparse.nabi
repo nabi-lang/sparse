@@ -1,0 +1,83 @@
+// Sparse kernels on the 2-d five-point Laplacian. SpMV items are stored
+// entries, so items/s reads as entries per second; the solver and
+// factorization benches run one solve or factorization per iteration.
+
+use pkg::{Csr, Order};
+use core::array::Vector;
+use core::bench::Bench;
+use core::hint::black_box;
+
+fn poisson(n: usize) -> Csr {
+    let t = try! pkg::diags([[2.0], [-1.0], [-1.0]], [0, 1, -1], [n, n]);
+    let i = pkg::eye(n);
+    pkg::kron(i, t) + pkg::kron(t, i)
+}
+
+#[bench]
+fn spmv_csr_300sq(b: Bench) {
+    let a = poisson(300);
+    let x = Vector::<f64>::ones([90000]);
+    b.set_items(a.nnz() as i64);
+    b.iter(|| try! black_box(a).matvec(x));
+}
+
+#[bench]
+fn spmv_csc_300sq(b: Bench) {
+    let a = poisson(300).to_csc();
+    let x = Vector::<f64>::ones([90000]);
+    b.set_items(a.nnz() as i64);
+    b.iter(|| try! black_box(a).matvec(x));
+}
+
+#[bench]
+fn spgemm_100sq(b: Bench) {
+    let a = poisson(100);
+    b.iter(|| try! black_box(a).matmul(a));
+}
+
+#[bench]
+fn cg_100sq(b: Bench) {
+    let a = poisson(100);
+    let rhs = Vector::<f64>::ones([10000]);
+    b.iter(|| try! pkg::cg(black_box(a), rhs));
+}
+
+#[bench]
+fn cg_ic0_100sq(b: Bench) {
+    let a = poisson(100);
+    let m = try! pkg::ic0(a);
+    let rhs = Vector::<f64>::ones([10000]);
+    b.iter(|| try! pkg::cg(black_box(a), rhs, pre: m));
+}
+
+#[bench]
+fn gmres_ilu0_100sq(b: Bench) {
+    let a = poisson(100);
+    let m = try! pkg::ilu0(a);
+    let rhs = Vector::<f64>::ones([10000]);
+    b.iter(|| try! pkg::gmres(black_box(a), rhs, pre: m));
+}
+
+#[bench]
+fn min_degree_100sq(b: Bench) {
+    let a = poisson(100);
+    b.iter(|| try! pkg::min_degree(black_box(a)));
+}
+
+#[bench]
+fn cholesky_100sq(b: Bench) {
+    let a = poisson(100);
+    b.iter(|| try! pkg::cholesky(black_box(a)));
+}
+
+#[bench]
+fn cholesky_rcm_100sq(b: Bench) {
+    let a = poisson(100);
+    b.iter(|| try! pkg::cholesky(black_box(a), order: Order::Rcm));
+}
+
+#[bench]
+fn lu_100sq(b: Bench) {
+    let a = poisson(100);
+    b.iter(|| try! pkg::lu(black_box(a)));
+}

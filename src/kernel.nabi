@@ -1,0 +1,46 @@
+//! Vector kernels on lists for the solvers' inner loops (no
+//! allocation), and the bridge to `Vector`.
+
+use pkg::csr::vector;
+use pkg::operator::Operator;
+use pkg::{Preconditioner, SparseError};
+use core::array::Vector;
+
+pub(pkg) fn dot(x: List<f64>, y: List<f64>) -> f64 {
+    let (s0, s1) = (0.0, 0.0);
+    let n = x.len();
+    let i = 0usize;
+    while i + 2 <= n {
+        s0 += x[i] * y[i];
+        s1 += x[i + 1] * y[i + 1];
+        i += 2;
+    }
+    if i < n { s0 += x[i] * y[i]; }
+    s0 + s1
+}
+
+pub(pkg) fn nrm2(x: List<f64>) -> f64 { dot(x, x).sqrt() }
+
+/// `y += a x`.
+pub(pkg) fn axpy(a: f64, x: List<f64>, y: List<f64>) {
+    for i in 0..x.len() { y[i] += a * x[i]; }
+}
+
+/// The elements of `v`, shared when contiguous.
+pub(pkg) fn list(v: Vector<f64>) -> List<f64> { v.as_list() ?? v.to_list() }
+
+/// `A x` through the operator as a fresh list (an operator may hand back
+/// its input), its length checked.
+pub(pkg) fn apply<A: Operator>(a: A, x: List<f64>) throws (SparseError) -> List<f64> {
+    let y = a.apply(vector(x)).to_list();
+    if y.len() != a.dims()[0] { throw SparseError::ShapeMismatch { what: f"the operator returned {y.len()} values for {a.dims()[0]} rows" }; }
+    y
+}
+
+/// `M^-1 r` through the preconditioner as a fresh list, its length
+/// checked.
+pub(pkg) fn precondition(m: any Preconditioner, r: List<f64>) throws (SparseError) -> List<f64> {
+    let z = m.precondition(vector(r)).to_list();
+    if z.len() != r.len() { throw SparseError::ShapeMismatch { what: f"the preconditioner returned {z.len()} values for {r.len()}" }; }
+    z
+}

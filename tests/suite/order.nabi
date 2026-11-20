@@ -1,0 +1,56 @@
+use pkg::tests::suite::{poisson2, random};
+
+fn is_perm(p: List<usize>, n: usize) -> bool {
+    if p.len() != n { return false; }
+    let seen = List::filled(n, false);
+    for i in p {
+        if i >= n || seen[i] { return false; }
+        seen[i] = true;
+    }
+    true
+}
+
+/// The bandwidth of `a` under `p`.
+fn band(a: pkg::Csr, p: List<usize>) -> usize {
+    let pinv = List::filled(p.len(), 0usize);
+    for i in 0..p.len() { pinv[p[i]] = i; }
+    let w = 0usize;
+    for i in 0..p.len() {
+        for q in a.indptr()[i]..a.indptr()[i + 1] {
+            let (x, y) = (pinv[i], pinv[a.indices()[q]]);
+            w = w.max(if x > y { x - y } else { y - x });
+        }
+    }
+    w
+}
+
+#[test]
+fn orders_are_permutations() {
+    for seed in 1u64..6 {
+        let a = random(40, 40, 3, 1.0, seed);
+        assert(is_perm(try! pkg::rcm(a), 40));
+        assert(is_perm(try! pkg::min_degree(a), 40));
+    }
+    let empty = try! pkg::Csr::from_triplets([5, 5], [], [], []);
+    assert(is_perm(try! pkg::rcm(empty), 5) && is_perm(try! pkg::min_degree(empty), 5));
+}
+
+#[test]
+fn rcm_shrinks_bandwidth() {
+    // A grid numbered column-major in blocks has bandwidth n; scramble it.
+    let a = poisson2(12);
+    let n = 144;
+    let shuffle = List::from_fn(n, |i| (i * 37) % n);
+    let (r, c, v): (List<usize>, List<usize>, List<f64>) = ([], [], []);
+    for i in 0..n {
+        for q in a.indptr()[i]..a.indptr()[i + 1] {
+            r.push(shuffle[i]);
+            c.push(shuffle[a.indices()[q]]);
+            v.push(a.data()[q]);
+        }
+    }
+    let s = try! pkg::Csr::from_triplets([n, n], r, c, v);
+    let natural = band(s, List::from_fn(n, |i| i));
+    let rc = band(s, try! pkg::rcm(s));
+    assert(rc <= 24 && rc < natural);
+}

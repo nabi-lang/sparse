@@ -1,0 +1,36 @@
+//! `Sparse`: what the factorizations and the solvers take, any of the
+//! three forms.
+
+use pkg::{Coo, Csc, Csr};
+
+/// A sparse matrix in any form: `Csr`, `Csc` or `Coo`. A function that
+/// takes `Sparse` converts once to the form it works in (free when it is
+/// already that form).
+///
+/// ```nabi
+/// use sparse::Sparse;
+///
+/// let a = sparse::eye(2);
+/// assert(a.as_csc().get(1, 1) == 1.0 && a.to_coo().as_csr() == a);
+/// ```
+pub trait Sparse {
+    /// Compressed rows.
+    fn as_csr(self) -> Csr;
+    /// Compressed columns.
+    fn as_csc(self) -> Csc;
+}
+
+impl Sparse for Csr {
+    fn as_csr(self) -> Csr { self }
+    fn as_csc(self) -> Csc { self.to_csc() }
+}
+
+impl Sparse for Csc {
+    fn as_csr(self) -> Csr { self.to_csr() }
+    fn as_csc(self) -> Csc { self }
+}
+
+impl Sparse for Coo {
+    fn as_csr(self) -> Csr { self.to_csr() }
+    fn as_csc(self) -> Csc { self.to_csc() }
+}

@@ -1,0 +1,80 @@
+//! Builders: identity, banded matrices from diagonals, Kronecker products.
+
+use pkg::compress::Cs;
+use pkg::{Csr, SparseError};
+
+/// The `n x n` identity.
+///
+/// ```nabi
+/// let i = sparse::eye(3);
+/// assert(i.nnz() == 3 && i.get(1, 1) == 1.0);
+/// ```
+pub fn eye(n: usize) -> Csr {
+    Csr { s: Cs { major: n, minor: n, ptr: List::from_fn(n + 1, |k| k), idx: List::from_fn(n, |k| k), val: List::filled(n, 1.0) } }
+}
+
+/// The `shape` matrix with `diagonals[d]` on diagonal `offsets[d]` (0 the
+/// main one, `k > 0` above it, `k < 0` below), as SciPy's `diags`. Each
+/// diagonal has its full length (`min(m, n - k)` for `k >= 0`, `min(m + k,
+/// n)` below) or one value, repeated.
+///
+/// ```nabi
+/// // The 1-d Laplacian: 2 on the diagonal, -1 next to it.
+/// let a = try sparse::diags([[2.0], [-1.0], [-1.0]], [0, 1, -1], [4, 4]);
+/// assert(a.nnz() == 10 && a.get(3, 2) == -1.0 && a.get(0, 0) == 2.0);
+/// ```
+pub fn diags(diagonals: List<List<f64>>, offsets: List<i64>, shape: [usize; 2]) throws (SparseError) -> Csr {
+    if diagonals.len() != offsets.len() {
+        throw SparseError::ShapeMismatch { what: f"{diagonals.len()} diagonals and {offsets.len()} offsets; pass one offset per diagonal" };
+    }
+    let (m, n) = (shape[0] as i64, shape[1] as i64);
+    let rows: List<usize> = [];
+    let cols: List<usize> = [];
+    let vals: List<f64> = [];
+    for d in 0..offsets.len() {
+        let k = offsets[d];
+        let len = if k >= 0 { m.min(n - k) } else { (m + k).min(n) };
+        if len <= 0 { throw SparseError::OutOfBounds { what: f"diagonal {k} of a {m} x {n} matrix" }; }
+        let v = diagonals[d];
+        if v.len() != len as usize && v.len() != 1 {
+            throw SparseError::ShapeMismatch { what: f"diagonal {k} has {v.len()} values, it needs {len} (or one, repeated)" };
+        }
+        for t in 0..len {
+            let (i, j) = if k >= 0 { (t, t + k) } else { (t - k, t) };
+            rows.push(i as usize);
+            cols.push(j as usize);
+            vals.push(if v.len() == 1 { v[0] } else { v[t as usize] });
+        }
+    }
+    try Csr::from_triplets(shape, rows, cols, vals)
+}
+
+/// The Kronecker product `A ⊗ B`: block `(i, j)` is `a[i, j] B`. The
+/// 2-d Laplacian is `kron(I, T) + kron(T, I)` for the 1-d one `T`.
+///
+/// ```nabi
+/// let t = try sparse::diags([[2.0], [-1.0], [-1.0]], [0, 1, -1], [3, 3]);
+/// let i = sparse::eye(3);
+/// let l = try sparse::kron(i, t).add(sparse::kron(t, i));
+/// assert(l.shape() == [9, 9] && l.get(4, 4) == 4.0 && l.get(4, 1) == -1.0);
+/// ```
+pub fn kron(a: Csr, b: Csr) -> Csr {
+    let (bm, bn) = (b.s.major, b.s.minor);
+    let ptr = List::filled(a.s.major * bm + 1, 0usize);
+    let idx: List<usize> = List::with_capacity(a.nnz() * b.nnz());
+    let val: List<f64> = List::with_capacity(a.nnz() * b.nnz());
+    for i in 0..a.s.major {
+        for r in 0..bm {
+            for p in a.s.ptr[i]..a.s.ptr[i + 1] {
+                let base = a.s.idx[p] * bn;
+                let x = a.s.val[p];
+                for q in b.s.ptr[r]..b.s.ptr[r + 1] {
+                    idx.push(base + b.s.idx[q]);
+                    val.push(x * b.s.val[q]);
+                }
+            }
+            ptr[i * bm + r + 1] = idx.len();
+        }
+    }
+    Csr { s: Cs { major: a.s.major * bm, minor: a.s.minor * bn, ptr, idx, val } }
+}

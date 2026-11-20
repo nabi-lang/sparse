@@ -1,0 +1,54 @@
+//! Preconditioned conjugate gradients (Hestenes and Stiefel 1952;
+//! Saad, Iterative Methods for Sparse Linear Systems, alg. 9.1).
+
+use pkg::iterative::{Solution, finish, residual, start};
+use pkg::kernel::{axpy, dot, nrm2, precondition};
+use pkg::operator::Operator;
+use pkg::precond::Identity;
+use pkg::{Preconditioner, SparseError};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// Solve `A x = b` for a symmetric positive definite `A` by conjugate
+/// gradients, with an SPD preconditioner `pre` (`Jacobi`, `ic0`, ...).
+/// Each step costs one `A x`, one `pre` and O(n); in exact arithmetic it
+/// ends within `n` steps, in practice after about `sqrt(cond(A))`
+/// unpreconditioned ones. A direction with `p^T A p <= 0` shows `A` is
+/// not positive definite and throws `NotPositiveDefinite`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let a = try sparse::diags([[4.0], [1.0], [1.0]], [0, 1, -1], [3, 3]);
+/// let s = try sparse::cg(a, [1, 2, 3]);
+/// let b: Vector<f64> = [1, 2, 3];
+/// assert((try a.matvec(s.x)).all_close(b, abs: 1e-8));
+/// ```
+pub fn cg<A: Operator, X: AsVector<f64>>(a: A, b: X, pre: any Preconditioner = Identity {}, x0: Vector<f64> | none = none, rtol: f64 = 1e-8, atol: f64 = 0.0, max_iter: usize | none = none) throws (SparseError) -> Solution {
+    let bv: Vector<f64> = b.as_vector();
+    let s = try start(a, bv, x0, rtol, atol, max_iter);
+    let x = s.x;
+    let r = try residual(a, s.b, x);
+    if nrm2(r) <= s.tol { return try finish(a, s, 0); }
+    let z = try precondition(pre, r);
+    let p = z.clone();
+    let rz = dot(r, z);
+    for k in 0..s.max_iter {
+        let ap = try pkg::kernel::apply(a, p);
+        let pap = dot(p, ap);
+        if !(pap > 0.0) {
+            if pap == 0.0 && nrm2(r) == 0.0 { return try finish(a, s, k); }
+            throw SparseError::NotPositiveDefinite { column: k };
+        }
+        let alpha = rz / pap;
+        axpy(alpha, p, x);
+        axpy(-alpha, ap, r);
+        if nrm2(r) <= s.tol { return try finish(a, s, k + 1); }
+        z = try precondition(pre, r);
+        let rz1 = dot(r, z);
+        let beta = rz1 / rz;
+        rz = rz1;
+        for i in 0..s.n { p[i] = z[i] + beta * p[i]; }
+    }
+    try finish(a, s, s.max_iter)
+}

@@ -1,0 +1,94 @@
+use pkg::tests::suite::{dense, random};
+use pkg::{Coo, Csc, Csr, SparseError};
+use core::array::Matrix;
+
+#[test]
+fn triplets_sum_and_sort() {
+    let a = try! Csr::from_triplets([3, 4], [2, 0, 2, 0, 1], [3, 1, 0, 1, 2], [1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert(a.nnz() == 4);
+    assert(a.indptr() == [0, 1, 2, 4]);
+    assert(a.indices() == [1, 2, 0, 3]);
+    assert(a.data() == [6.0, 5.0, 3.0, 1.0]);
+    let m: Matrix<f64> = [[0, 6, 0, 0], [0, 0, 5, 0], [3, 0, 0, 1]];
+    assert(a.to_dense() == m);
+}
+
+#[test]
+fn round_trips() {
+    for seed in 1u64..6 {
+        let a = random(13, 7, 3, 0.0, seed);
+        let d = dense(a);
+        assert(Csr::from_dense(d) == a);
+        assert(a.to_csc().to_csr() == a);
+        assert(a.to_coo().to_csr() == a);
+        assert(a.to_csc().to_dense() == d);
+        assert(a.to_coo().to_dense() == d);
+        assert(a.to_coo().to_csc() == a.to_csc());
+        assert(a.transpose().to_dense() == d.t().copy());
+        assert(a.t().to_dense() == d.t().copy());
+        assert(a.t().to_csr() == a.transpose());
+        assert(Csc::from_dense(d) == a.to_csc());
+        let c = a.to_csc();
+        assert(try! Csc::new(c.shape(), c.indptr(), c.indices(), c.data()) == c);
+    }
+}
+
+#[test]
+fn new_sorts_and_checks() {
+    let a = try! Csr::new([2, 3], [0, 3, 3], [2, 0, 2], [1.0, 2.0, 3.0]);
+    assert(a.indices() == [0, 2] && a.data() == [2.0, 4.0]);
+    let bad = |f: fn() throws (SparseError)| -> bool { try { f(); false } catch _: SparseError { true } };
+    assert(bad(|| { _ = try Csr::new([2, 2], [0, 1], [0], [1.0]); }));
+    assert(bad(|| { _ = try Csr::new([2, 2], [1, 1, 1], [0], [1.0]); }));
+    assert(bad(|| { _ = try Csr::new([2, 2], [0, 2, 1], [0, 1], [1.0, 1.0]); }));
+    assert(bad(|| { _ = try Csr::new([2, 2], [0, 1, 1], [5], [1.0]); }));
+    assert(bad(|| { _ = try Csr::from_triplets([2, 2], [0, 2], [0, 0], [1.0, 1.0]); }));
+    assert(bad(|| { _ = try Csr::from_triplets([2, 2], [0], [0, 0], [1.0]); }));
+    assert(bad(|| { _ = try Coo::from_triplets([2, 2], [0], [3], [1.0]); }));
+    assert(bad(|| { _ = try pkg::diags([[1.0, 2.0, 3.0]], [0], [2, 2]); }));
+    assert(bad(|| { _ = try pkg::diags([[1.0]], [5], [2, 2]); }));
+}
+
+#[test]
+fn empty_and_tiny() {
+    let z = try! Csr::from_triplets([0, 0], [], [], []);
+    assert(z.nnz() == 0 && z.to_dense().shape() == [0, 0]);
+    let e = try! Csr::from_triplets([3, 2], [], [], []);
+    assert((try! e.matvec([1.0, 2.0])).to_list() == [0.0, 0.0, 0.0]);
+    assert(e.to_csc().indptr() == [0, 0, 0]);
+    let one = try! Csr::from_triplets([1, 1], [0], [0], [5.0]);
+    assert((try! pkg::lu(one)).det() == 5.0);
+    assert((try! (try! pkg::cholesky(one)).solve([10.0])).to_list() == [2.0]);
+}
+
+#[test]
+fn coo_push() {
+    let c = Coo::new([2, 2]);
+    try! c.push(1, 0, 1.0);
+    try! c.push(1, 0, 2.0);
+    assert(c.nnz() == 2 && c.to_csr().get(1, 0) == 3.0 && c.to_csr().nnz() == 1);
+    assert(try { try c.push(2, 0, 1.0); false } catch _: SparseError { true });
+}
+
+#[test]
+fn slicing_and_diagonal() {
+    let a = random(8, 6, 3, 2.0, 9);
+    let d = dense(a);
+    let r = try! a.rows(2..5);
+    assert(r.to_dense() == d[2:5, :].copy());
+    let c = try! a.cols(1..4);
+    assert(c.to_dense() == d[:, 1:4].copy());
+    assert((try! a.to_csc().cols(1..4)).to_dense() == d[:, 1:4].copy());
+    assert((try! a.to_csc().rows(2..5)).to_dense() == d[2:5, :].copy());
+    for i in 0..6 { assert(a.diagonal()[i] == d[i, i]); }
+    assert(try { _ = try a.rows(3..9); false } catch _: SparseError { true });
+}
+
+#[test]
+fn diags_offsets() {
+    let a = try! pkg::diags([[1.0, 2.0], [3.0, 4.0]], [1, -1], [3, 3]);
+    let m: Matrix<f64> = [[0, 1, 0], [3, 0, 2], [0, 4, 0]];
+    assert(a.to_dense() == m);
+    let w = try! pkg::diags([[7.0]], [2], [2, 4]);
+    assert(w.nnz() == 2 && w.get(1, 3) == 7.0);
+}

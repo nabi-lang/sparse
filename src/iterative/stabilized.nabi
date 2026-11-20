@@ -1,0 +1,63 @@
+//! BiCGSTAB with right preconditioning (van der Vorst 1992; Saad,
+//! Iterative Methods for Sparse Linear Systems, alg. 7.7).
+
+use pkg::iterative::{Solution, finish, residual, start};
+use pkg::kernel::{apply, axpy, dot, nrm2, precondition};
+use pkg::operator::Operator;
+use pkg::precond::Identity;
+use pkg::{Preconditioner, SparseError};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// Solve `A x = b` for any square nonsingular `A` by BiCGSTAB: short
+/// recurrences, so memory O(n) whatever the step count; each step costs
+/// two `A x` and two `pre`. Convergence is not monotone and it can break
+/// down (a zero inner product): that throws `Breakdown`, after which
+/// `gmres` is the safe choice.
+///
+/// ```nabi
+/// let a = try sparse::diags([[3.0], [-1.5], [-0.5]], [0, 1, -1], [50, 50]);
+/// let s = try sparse::bicgstab(a, List::filled(50, 1.0), pre: try sparse::ilu0(a));
+/// assert(s.residual <= 1e-8 * 50.0.sqrt());
+/// ```
+pub fn bicgstab<A: Operator, X: AsVector<f64>>(a: A, b: X, pre: any Preconditioner = Identity {}, x0: Vector<f64> | none = none, rtol: f64 = 1e-8, atol: f64 = 0.0, max_iter: usize | none = none) throws (SparseError) -> Solution {
+    let bv: Vector<f64> = b.as_vector();
+    let s = try start(a, bv, x0, rtol, atol, max_iter);
+    let n = s.n;
+    let x = s.x;
+    let r = try residual(a, s.b, x);
+    if nrm2(r) <= s.tol { return try finish(a, s, 0); }
+    let rh = r.clone();
+    let (rho, alpha, omega) = (1.0, 1.0, 1.0);
+    let v = List::filled(n, 0.0);
+    let p = List::filled(n, 0.0);
+    for k in 0..s.max_iter {
+        let rho1 = dot(rh, r);
+        if rho1 == 0.0 { throw SparseError::Breakdown { iterations: k, what: "rho" }; }
+        let beta = (rho1 / rho) * (alpha / omega);
+        for i in 0..n { p[i] = r[i] + beta * (p[i] - omega * v[i]); }
+        let ph = try precondition(pre, p);
+        v = try apply(a, ph);
+        let rv = dot(rh, v);
+        if rv == 0.0 { throw SparseError::Breakdown { iterations: k, what: "the inner product of r0 and A p" }; }
+        alpha = rho1 / rv;
+        // s = r - alpha v, kept in r.
+        axpy(-alpha, v, r);
+        if nrm2(r) <= s.tol {
+            axpy(alpha, ph, x);
+            return try finish(a, s, k + 1);
+        }
+        let sh = try precondition(pre, r);
+        let t = try apply(a, sh);
+        let tt = dot(t, t);
+        if tt == 0.0 { throw SparseError::Breakdown { iterations: k, what: "A s" }; }
+        omega = dot(t, r) / tt;
+        axpy(alpha, ph, x);
+        axpy(omega, sh, x);
+        axpy(-omega, t, r);
+        if nrm2(r) <= s.tol { return try finish(a, s, k + 1); }
+        if omega == 0.0 { throw SparseError::Breakdown { iterations: k, what: "omega" }; }
+        rho = rho1;
+    }
+    try finish(a, s, s.max_iter)
+}

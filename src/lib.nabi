@@ -1,0 +1,63 @@
+//! Sparse matrices on core's `Array`: compressed rows (`Csr`), compressed
+//! columns (`Csc`) and triplets (`Coo`), their products and conversions,
+//! Krylov solvers (`cg`, `gmres`, `bicgstab`) with preconditioners
+//! (`Jacobi`, `ilu0`, `ic0`) that also take matrix-free operators, and
+//! direct factorizations (`cholesky`, `lu`) after a fill-reducing order.
+//! Values are f64. Bad input throws a `SparseError` that says what to
+//! call instead; nothing panics except the operators, which cannot
+//! throw and panic on a shape mismatch as core's do.
+//!
+//! Pure Nabi, so every target, wasm included, gets the same results.
+
+#[cfg(feature = "ops")]
+pub mod ops;
+
+mod arith;
+mod build;
+mod compress;
+mod coo;
+mod csc;
+mod csr;
+mod direct;
+mod error;
+mod form;
+mod iterative;
+mod kernel;
+mod operator;
+mod order;
+mod precond;
+
+pub use build::{diags, eye, kron};
+pub use coo::Coo;
+pub use csc::Csc;
+pub use csr::Csr;
+pub use direct::{Cholesky, Lu, cholesky, lu};
+pub use error::SparseError;
+pub use form::Sparse;
+pub use iterative::{Solution, bicgstab, cg, gmres};
+pub use operator::{FnOperator, Operator, operator};
+pub use order::{Order, min_degree, rcm};
+pub use precond::{Ic0, Identity, Ilu0, Jacobi, ic0, ilu0};
+
+use core::array::Vector;
+
+// Defined at the root: the compiler names an `any` parameter's trait by
+// its defining path in other packages' builds, and a private module
+// there fails them.
+/// `r -> M^-1 r` for some `M` close to `A` and cheap to solve with:
+/// `Identity` (none), `Jacobi`, `Ilu0`, `Ic0`, or an exact `Cholesky` /
+/// `Lu` of a nearby matrix.
+///
+/// ```nabi
+/// use sparse::Preconditioner;
+/// use core::array::Vector;
+///
+/// let a = try sparse::diags([[4.0, 2.0]], [0], [2, 2]);
+/// let m = try sparse::Jacobi::new(a);
+/// let r: Vector<f64> = [4, 4];
+/// assert(m.precondition(r).to_list() == [1.0, 2.0]);
+/// ```
+pub trait Preconditioner {
+    /// `M^-1 r`.
+    fn precondition(self, r: Vector<f64>) -> Vector<f64>;
+}

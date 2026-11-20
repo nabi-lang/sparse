@@ -1,0 +1,48 @@
+//! Preconditioners: an approximate inverse `M^-1` the iterative solvers
+//! apply each step to converge in fewer of them.
+
+mod incomplete;
+
+pub use pkg::precond::incomplete::{Ic0, Ilu0, ic0, ilu0};
+
+use pkg::csr::vector;
+use pkg::kernel::list;
+use pkg::{Preconditioner, Sparse, SparseError};
+use core::array::Vector;
+
+/// No preconditioning: `M = I`. The solvers' default.
+#[derive(Clone)]
+pub struct Identity {}
+
+impl Preconditioner for Identity {
+    fn precondition(self, r: Vector<f64>) -> Vector<f64> { r }
+}
+
+/// `M = diag(A)`: divides by the diagonal. Cheap; helps when rows are
+/// scaled very differently.
+#[derive(Clone)]
+pub struct Jacobi {
+    pub(pkg) inv: List<f64>;
+}
+
+impl Jacobi {
+    /// The Jacobi preconditioner of a square `a`; a zero on the diagonal
+    /// throws `Singular`.
+    pub fn new<S: Sparse>(a: S) throws (SparseError) -> Jacobi {
+        let c = a.as_csr();
+        let s = c.shape();
+        try pkg::error::square(s[0], s[1]);
+        let d = c.s.diagonal();
+        for i in 0..d.len() {
+            if d[i] == 0.0 || !d[i].is_finite() { throw SparseError::Singular { column: i }; }
+        }
+        Jacobi { inv: List::from_fn(d.len(), |i| 1.0 / d[i]) }
+    }
+}
+
+impl Preconditioner for Jacobi {
+    fn precondition(self, r: Vector<f64>) -> Vector<f64> {
+        let xs = list(r);
+        vector(List::from_fn(xs.len(), |i| xs[i] * self.inv[i]))
+    }
+}

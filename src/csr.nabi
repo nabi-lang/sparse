@@ -1,0 +1,259 @@
+//! `Csr`, compressed sparse rows: fast row access and `A x`.
+
+use pkg::compress::{Cs, same};
+use pkg::error::mismatch;
+use pkg::{Coo, Csc, SparseError};
+use core::array::{Array, Matrix, Vector};
+use core::range::Range;
+use linalg::AsVector;
+
+/// A sparse matrix in compressed sparse row form: row `i`'s column
+/// indices are `indices()[indptr()[i]..indptr()[i + 1]]`, rising, with
+/// their values in `data()`. Build one with `from_triplets`, `from_dense`,
+/// `eye`, `diags` or `Coo::to_csr`; `A x` costs O(nnz).
+///
+/// ```nabi
+/// use sparse::Csr;
+///
+/// let a = try Csr::from_triplets([2, 3], [0, 1, 1, 0], [0, 2, 2, 1], [1.0, 2.0, 3.0, 4.0]);
+/// assert(a.nnz() == 3 && a.get(1, 2) == 5.0 && a.get(1, 0) == 0.0);
+/// let y = try a.matvec([1, 1, 1]);
+/// assert(y.to_list() == [5.0, 5.0]);
+/// ```
+#[derive(Clone)]
+pub struct Csr {
+    pub(pkg) s: Cs;
+}
+
+impl Csr {
+    /// The matrix of `shape` from its compressed arrays (see `Csr`).
+    /// Unsorted rows and repeated columns are sorted and summed; arrays
+    /// that do not describe a matrix throw `BadStructure`.
+    ///
+    /// ```nabi
+    /// use sparse::Csr;
+    ///
+    /// let a = try Csr::new([2, 2], [0, 1, 2], [1, 0], [5.0, 6.0]);
+    /// assert(a.get(0, 1) == 5.0 && a.get(1, 0) == 6.0);
+    /// ```
+    pub fn new(shape: [usize; 2], indptr: List<usize>, indices: List<usize>, data: List<f64>) throws (SparseError) -> Csr {
+        Csr { s: try Cs::checked(shape[0], shape[1], indptr, indices, data) }
+    }
+
+    /// The matrix with `vals[p]` at `(rows[p], cols[p])`; repeated
+    /// positions are summed (the finite-element assembly rule).
+    ///
+    /// ```nabi
+    /// use sparse::Csr;
+    ///
+    /// let a = try Csr::from_triplets([2, 2], [0, 0, 1], [0, 0, 1], [1.0, 2.0, 4.0]);
+    /// assert(a.get(0, 0) == 3.0 && a.nnz() == 2);
+    /// ```
+    pub fn from_triplets(shape: [usize; 2], rows: List<usize>, cols: List<usize>, vals: List<f64>) throws (SparseError) -> Csr {
+        Csr { s: try Cs::from_triplets(shape[0], shape[1], rows, cols, vals) }
+    }
+
+    /// The entries of `m` with `|x| > drop` (default: every nonzero).
+    ///
+    /// ```nabi
+    /// use sparse::Csr;
+    /// use core::array::Matrix;
+    ///
+    /// let m: Matrix<f64> = [[1, 0], [0, 1e-20]];
+    /// assert(Csr::from_dense(m).nnz() == 2);
+    /// assert(Csr::from_dense(m, drop: 1e-12).nnz() == 1);
+    /// ```
+    pub fn from_dense(m: Matrix<f64>, drop: f64 = 0.0) -> Csr {
+        let s = m.shape();
+        Csr { s: Cs::of_dense(m.as_list() ?? m.to_list(), s[0], s[1], drop) }
+    }
+
+    /// `[rows, cols]`.
+    pub fn shape(self) -> [usize; 2] { [self.s.major, self.s.minor] }
+
+    /// The number of stored entries.
+    pub fn nnz(self) -> usize { self.s.nnz() }
+
+    /// The row pointers: `rows + 1` offsets into `indices` and `data`.
+    pub fn indptr(self) -> List<usize> { self.s.ptr }
+
+    /// The column index of each stored entry, row by row.
+    pub fn indices(self) -> List<usize> { self.s.idx }
+
+    /// The value of each stored entry, row by row.
+    pub fn data(self) -> List<f64> { self.s.val }
+
+    /// The element at `(i, j)`: 0 where nothing is stored. O(log of the
+    /// row's length). Panics outside the shape, as indexing does.
+    ///
+    /// ```nabi
+    /// let a = sparse::eye(3);
+    /// assert(a.get(2, 2) == 1.0 && a.get(0, 2) == 0.0);
+    /// ```
+    #[track_caller]
+    pub fn get(self, i: usize, j: usize) -> f64 {
+        if i >= self.s.major || j >= self.s.minor { panic(f"index ({i}, {j}) out of bounds for a {self.s.major} x {self.s.minor} matrix"); }
+        self.s.get(i, j)
+    }
+
+    /// `A x`. O(nnz).
+    ///
+    /// ```nabi
+    /// let a = try sparse::diags([[2.0, 2.0], [1.0]], [0, 1], [2, 2]);
+    /// assert((try a.matvec([1, 1])).to_list() == [3.0, 2.0]);
+    /// ```
+    pub fn matvec<X: AsVector<f64>>(self, x: X) throws (SparseError) -> Vector<f64> {
+        let v: Vector<f64> = x.as_vector();
+        if v.len() != self.s.minor { throw mismatch("matvec", f"a {self.s.major} x {self.s.minor} matrix", f"a vector of {v.len()}"); }
+        vector(self.s.gather(v.as_list() ?? v.to_list()))
+    }
+
+    /// `A^T x`. O(nnz).
+    ///
+    /// ```nabi
+    /// let a = try sparse::diags([[2.0, 2.0], [1.0]], [0, 1], [2, 2]);
+    /// assert((try a.rmatvec([1, 1])).to_list() == [2.0, 3.0]);
+    /// ```
+    pub fn rmatvec<X: AsVector<f64>>(self, x: X) throws (SparseError) -> Vector<f64> {
+        let v: Vector<f64> = x.as_vector();
+        if v.len() != self.s.major { throw mismatch("rmatvec", f"a {self.s.major} x {self.s.minor} matrix", f"a vector of {v.len()}"); }
+        vector(self.s.scatter(v.as_list() ?? v.to_list()))
+    }
+
+    /// `A B` for a dense `B`: one sparse row times `B` per row of the
+    /// answer. O(nnz * B's columns).
+    ///
+    /// ```nabi
+    /// use core::array::Matrix;
+    ///
+    /// let b: Matrix<f64> = [[1, 2], [3, 4]];
+    /// assert(try sparse::eye(2).matmul_dense(b) == b);
+    /// ```
+    pub fn matmul_dense(self, b: Matrix<f64>) throws (SparseError) -> Matrix<f64> {
+        let t = b.shape();
+        if t[0] != self.s.minor { throw mismatch("matmul_dense", f"a {self.s.major} x {self.s.minor} matrix", f"{t[0]} x {t[1]}"); }
+        let bs = b.as_list() ?? b.to_list();
+        let w = t[1];
+        let out = List::filled(self.s.major * w, 0.0);
+        for i in 0..self.s.major {
+            for p in self.s.ptr[i]..self.s.ptr[i + 1] {
+                let a = self.s.val[p];
+                let k = self.s.idx[p] * w;
+                for j in 0..w { out[i * w + j] += a * bs[k + j]; }
+            }
+        }
+        Array::view_list(out, [self.s.major, w])
+    }
+
+    /// `A B` for a sparse `B` (Gustavson's algorithm).
+    ///
+    /// ```nabi
+    /// let a = try sparse::diags([[1.0, 2.0]], [0], [2, 2]);
+    /// let b = try a.matmul(a);
+    /// assert(b.get(1, 1) == 4.0 && b.nnz() == 2);
+    /// ```
+    pub fn matmul(self, b: Csr) throws (SparseError) -> Csr {
+        if b.s.major != self.s.minor { throw mismatch("matmul", f"a {self.s.major} x {self.s.minor} matrix", f"{b.s.major} x {b.s.minor}"); }
+        Csr { s: self.s.product(b.s) }
+    }
+
+    /// `A + B`.
+    ///
+    /// ```nabi
+    /// let a = sparse::eye(2);
+    /// assert((try a.add(a)).get(1, 1) == 2.0);
+    /// ```
+    pub fn add(self, b: Csr) throws (SparseError) -> Csr {
+        try same("add", self.shape(), b.shape());
+        Csr { s: self.s.combine(1.0, b.s, 1.0) }
+    }
+
+    /// `A - B`.
+    pub fn sub(self, b: Csr) throws (SparseError) -> Csr {
+        try same("sub", self.shape(), b.shape());
+        Csr { s: self.s.combine(1.0, b.s, -1.0) }
+    }
+
+    /// `s A`.
+    ///
+    /// ```nabi
+    /// assert(sparse::eye(2).scale(3.0).get(0, 0) == 3.0);
+    /// ```
+    pub fn scale(self, s: f64) -> Csr { Csr { s: self.s.scaled(s) } }
+
+    /// The transpose as a `Csc` sharing these arrays: O(1).
+    ///
+    /// ```nabi
+    /// let a = try sparse::Csr::from_triplets([2, 3], [0], [2], [7.0]);
+    /// assert(a.t().shape() == [3, 2] && a.t().get(2, 0) == 7.0);
+    /// ```
+    pub fn t(self) -> Csc { Csc { s: self.s } }
+
+    /// The transpose as a new `Csr`. O(nnz).
+    pub fn transpose(self) -> Csr { Csr { s: self.s.transpose() } }
+
+    /// The same matrix in compressed sparse column form. O(nnz).
+    ///
+    /// ```nabi
+    /// let a = sparse::eye(3);
+    /// assert(a.to_csc().get(1, 1) == 1.0);
+    /// ```
+    pub fn to_csc(self) -> Csc { Csc { s: self.s.transpose() } }
+
+    /// The entries as triplets.
+    pub fn to_coo(self) -> Coo {
+        let rows: List<usize> = List::with_capacity(self.nnz());
+        for i in 0..self.s.major {
+            for _ in self.s.ptr[i]..self.s.ptr[i + 1] { rows.push(i); }
+        }
+        Coo { m: self.s.major, n: self.s.minor, rows, cols: self.s.idx.clone(), vals: self.s.val.clone() }
+    }
+
+    /// The dense matrix.
+    ///
+    /// ```nabi
+    /// let d = sparse::eye(2).to_dense();
+    /// assert(d[1, 1] == 1.0 && d[0, 1] == 0.0);
+    /// ```
+    pub fn to_dense(self) -> Matrix<f64> { Array::view_list(self.s.dense(true), [self.s.major, self.s.minor]) }
+
+    /// The main diagonal.
+    pub fn diagonal(self) -> Vector<f64> { vector(self.s.diagonal()) }
+
+    /// Rows `r`, as a new matrix.
+    ///
+    /// ```nabi
+    /// let a = sparse::eye(4);
+    /// let b = try a.rows(1..3);
+    /// assert(b.shape() == [2, 4] && b.get(0, 1) == 1.0);
+    /// ```
+    pub fn rows(self, r: Range<usize>) throws (SparseError) -> Csr { Csr { s: try self.s.slices(r) } }
+
+    /// Columns `r`, as a new matrix.
+    ///
+    /// ```nabi
+    /// let a = sparse::eye(4);
+    /// let b = try a.cols(2..4);
+    /// assert(b.shape() == [4, 2] && b.get(3, 1) == 1.0);
+    /// ```
+    pub fn cols(self, r: Range<usize>) throws (SparseError) -> Csr { Csr { s: try self.s.within(r) } }
+}
+
+impl PartialEq for Csr {
+    fn eq(self, rhs: Csr) -> bool { cs_eq(self.s, rhs.s) }
+    fn ne(self, rhs: Csr) -> bool { !self.eq(rhs) }
+}
+
+impl Debug for Csr {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        try f.write_str(f"Csr({self.s.major} x {self.s.minor}, {self.nnz()} stored)")
+    }
+}
+
+/// Same shape, pattern and values.
+pub(pkg) fn cs_eq(a: Cs, b: Cs) -> bool {
+    a.major == b.major && a.minor == b.minor && a.ptr == b.ptr && a.idx == b.idx && a.val == b.val
+}
+
+/// The rank-1 array over `xs` (no copy).
+pub(pkg) fn vector(xs: List<f64>) -> Vector<f64> { Array::view_list(xs, [xs.len()]) }

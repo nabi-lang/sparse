@@ -1,0 +1,192 @@
+//! Up-looking sparse Cholesky (Davis, Direct Methods for Sparse Linear
+//! Systems, 2006, ch. 4): the elimination tree gives each row's pattern
+//! of `L` as a reach in the tree, so the symbolic step costs O(|L|) and
+//! the numeric one O(flops).
+
+use pkg::compress::Cs;
+use pkg::direct::{inverse, out, rhs};
+use pkg::order::{Order, permutation};
+use pkg::{Csc, Preconditioner, Sparse, SparseError};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// `P A P^T = L L^T` for a sparse symmetric positive definite `A`. See
+/// `cholesky`.
+#[derive(Clone)]
+pub struct Cholesky {
+    pub(pkg) n: usize;
+    pub(pkg) p: List<usize>;
+    /// Columns of `L`, the diagonal first in each.
+    pub(pkg) l: Cs;
+}
+
+/// The sparse Cholesky factorization of a symmetric positive definite
+/// `a` after the fill-reducing `order` (default minimum degree). A matrix
+/// that is not symmetric throws `NotSymmetric`, one that is not positive
+/// definite `NotPositiveDefinite`. Cost O(flops of L), about n^1.5 on a
+/// 2-d grid with minimum degree.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let t = try sparse::diags([[4.0], [-1.0], [-1.0]], [0, 1, -1], [10, 10]);
+/// let a = try sparse::kron(sparse::eye(10), t).add(sparse::kron(t, sparse::eye(10)));
+/// let f = try sparse::cholesky(a);
+/// let x = try f.solve(List::filled(100, 1.0));
+/// assert((try a.matvec(x)).all_close(Vector::<f64>::ones([100])));
+/// ```
+pub fn cholesky<S: Sparse>(a: S, order: Order = Order::MinDegree) throws (SparseError) -> Cholesky {
+    let c = a.as_csc();
+    let sh = c.shape();
+    try pkg::error::square(sh[0], sh[1]);
+    let n = sh[0];
+    try pkg::error::finite(c.s.val);
+    if let (i, j): (usize, usize) = c.s.asymmetry() { throw SparseError::NotSymmetric { row: j, col: i }; }
+    let p = permutation(c.s, order);
+    let pinv = inverse(p);
+    // The upper triangle of C = P A P^T by columns.
+    let (ci, cj, cv): (List<usize>, List<usize>, List<f64>) = ([], [], []);
+    for j in 0..n {
+        for q in c.s.ptr[j]..c.s.ptr[j + 1] {
+            let (r, k) = (pinv[c.s.idx[q]], pinv[j]);
+            if r <= k {
+                ci.push(r);
+                cj.push(k);
+                cv.push(c.s.val[q]);
+            }
+        }
+    }
+    let u = try Cs::from_triplets(n, n, cj, ci, cv);
+    let none_ = usize::MAX;
+    // Elimination tree, with path compression through `anc`.
+    let parent = List::filled(n, none_);
+    let anc = List::filled(n, none_);
+    for k in 0..n {
+        for q in u.ptr[k]..u.ptr[k + 1] {
+            let i = u.idx[q];
+            while i != none_ && i < k {
+                let nx = anc[i];
+                anc[i] = k;
+                if nx == none_ { parent[i] = k; }
+                i = nx;
+            }
+        }
+    }
+    let w = List::filled(n, none_);
+    let s = List::filled(n, 0usize);
+    // Column counts of L: row k's pattern is the reach of C's column k.
+    let cnt = List::filled(n, 1usize);
+    for k in 0..n {
+        let top = reach(u, k, parent, s, w);
+        for t in top..n { cnt[s[t]] += 1; }
+    }
+    let lp = List::filled(n + 1, 0usize);
+    for j in 0..n { lp[j + 1] = lp[j] + cnt[j]; }
+    let li = List::filled(lp[n], 0usize);
+    let lx = List::filled(lp[n], 0.0);
+    let next = lp.clone();
+    let x = List::filled(n, 0.0);
+    for j in 0..n { w[j] = none_; }
+    for k in 0..n {
+        let top = reach(u, k, parent, s, w);
+        for q in u.ptr[k]..u.ptr[k + 1] { x[u.idx[q]] = u.val[q]; }
+        let d = x[k];
+        x[k] = 0.0;
+        for t in top..n {
+            let i = s[t];
+            let lki = x[i] / lx[lp[i]];
+            x[i] = 0.0;
+            for q in lp[i] + 1..next[i] { x[li[q]] -= lx[q] * lki; }
+            d -= lki * lki;
+            let q = next[i];
+            next[i] = q + 1;
+            li[q] = k;
+            lx[q] = lki;
+        }
+        if !(d > 0.0) { throw SparseError::NotPositiveDefinite { column: k }; }
+        let q = next[k];
+        next[k] = q + 1;
+        li[q] = k;
+        lx[q] = d.sqrt();
+    }
+    Cholesky { n, p, l: Cs { major: n, minor: n, ptr: lp, idx: li, val: lx } }
+}
+
+/// The pattern of row `k` of `L`: the nodes reached from column `k` of
+/// the upper triangle `u` up the elimination tree, in `s[top..n]` in
+/// topological order. `w` marks visited nodes with `k`.
+fn reach(u: Cs, k: usize, parent: List<usize>, s: List<usize>, w: List<usize>) -> usize {
+    let n = u.major;
+    let top = n;
+    w[k] = k;
+    for q in u.ptr[k]..u.ptr[k + 1] {
+        let i = u.idx[q];
+        if i > k { continue; }
+        let len = 0usize;
+        while w[i] != k {
+            s[len] = i;
+            len += 1;
+            w[i] = k;
+            i = parent[i];
+        }
+        while len > 0 {
+            len -= 1;
+            top -= 1;
+            s[top] = s[len];
+        }
+    }
+    top
+}
+
+impl Cholesky {
+    /// `x` with `A x = b`: two triangular solves, O(|L|).
+    pub fn solve<X: AsVector<f64>>(self, b: X) throws (SparseError) -> Vector<f64> {
+        let bs = try rhs(b, self.n);
+        out(self.apply(bs))
+    }
+
+    pub(pkg) fn apply(self, bs: List<f64>) -> List<f64> {
+        let (n, l) = (self.n, self.l);
+        let y = List::from_fn(n, |i| bs[self.p[i]]);
+        for j in 0..n {
+            y[j] /= l.val[l.ptr[j]];
+            let yj = y[j];
+            for q in l.ptr[j] + 1..l.ptr[j + 1] { y[l.idx[q]] -= l.val[q] * yj; }
+        }
+        for t in 0..n {
+            let j = n - 1 - t;
+            let s = y[j];
+            for q in l.ptr[j] + 1..l.ptr[j + 1] { s -= l.val[q] * y[l.idx[q]]; }
+            y[j] = s / l.val[l.ptr[j]];
+        }
+        let x = List::filled(n, 0.0);
+        for i in 0..n { x[self.p[i]] = y[i]; }
+        x
+    }
+
+    /// The factor `L` (lower triangular, of `P A P^T`).
+    pub fn l(self) -> Csc { Csc { s: self.l } }
+
+    /// The permutation: row and column `i` of `P A P^T` are `perm()[i]`
+    /// of `A`.
+    pub fn perm(self) -> List<usize> { self.p }
+
+    /// The number of stored entries of `L` (the fill shows here).
+    pub fn nnz(self) -> usize { self.l.nnz() }
+
+    /// `ln det A`, `2 sum ln L_ii`: no overflow for large matrices.
+    ///
+    /// ```nabi
+    /// let a = try sparse::diags([[2.0, 8.0]], [0], [2, 2]);
+    /// assert(((try sparse::cholesky(a)).logdet() - 16.0.ln()).abs() < 1e-14);
+    /// ```
+    pub fn logdet(self) -> f64 {
+        let s = 0.0;
+        for j in 0..self.n { s += self.l.val[self.l.ptr[j]].ln(); }
+        2.0 * s
+    }
+}
+
+impl Preconditioner for Cholesky {
+    fn precondition(self, r: Vector<f64>) -> Vector<f64> { out(self.apply(r.as_list() ?? r.to_list())) }
+}

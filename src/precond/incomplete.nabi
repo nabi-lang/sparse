@@ -1,0 +1,163 @@
+//! Incomplete factorizations with no fill: ILU(0) keeps the pattern of
+//! `A`, IC(0) the pattern of its lower triangle (Saad, Iterative Methods
+//! for Sparse Linear Systems, 2nd ed., 10.3).
+
+use pkg::compress::Cs;
+use pkg::csr::vector;
+use pkg::kernel::list;
+use pkg::{Preconditioner, Sparse, SparseError};
+use core::array::Vector;
+
+/// `A ~ L U` on the pattern of `A` (`L` unit lower, both stored in one
+/// CSR). See `ilu0`.
+#[derive(Clone)]
+pub struct Ilu0 {
+    pub(pkg) f: Cs;
+    pub(pkg) diag: List<usize>;
+}
+
+/// The ILU(0) preconditioner of a square `a`: Gaussian elimination that
+/// drops every fill-in outside `a`'s pattern (IKJ order). A zero or
+/// missing diagonal pivot throws `Singular`. O(sum of row lengths
+/// squared).
+///
+/// ```nabi
+/// let t = try sparse::diags([[4.0], [-1.0], [-1.0]], [0, 1, -1], [100, 100]);
+/// let s = try sparse::gmres(t, List::filled(100, 1.0), pre: try sparse::ilu0(t));
+/// assert(s.iterations <= 2);    // ILU(0) of a tridiagonal matrix is exact
+/// ```
+pub fn ilu0<S: Sparse>(a: S) throws (SparseError) -> Ilu0 {
+    let c = a.as_csr();
+    let s = c.shape();
+    try pkg::error::square(s[0], s[1]);
+    let f = c.s.clone();
+    f.val = c.s.val.clone();
+    let n = s[0];
+    let diag = try f.diagonal_at();
+    let at = List::filled(n, usize::MAX);
+    for i in 0..n {
+        let (lo, hi) = (f.ptr[i], f.ptr[i + 1]);
+        for p in lo..hi { at[f.idx[p]] = p; }
+        for p in lo..hi {
+            let k = f.idx[p];
+            if k >= i { break; }
+            let l = f.val[p] / f.val[diag[k]];
+            f.val[p] = l;
+            for q in diag[k] + 1..f.ptr[k + 1] {
+                let w = at[f.idx[q]];
+                if w != usize::MAX { f.val[w] -= l * f.val[q]; }
+            }
+        }
+        for p in lo..hi { at[f.idx[p]] = usize::MAX; }
+        let d = f.val[diag[i]];
+        if d == 0.0 || !d.is_finite() { throw SparseError::Singular { column: i }; }
+    }
+    Ilu0 { f, diag }
+}
+
+impl Preconditioner for Ilu0 {
+    fn precondition(self, r: Vector<f64>) -> Vector<f64> {
+        let f = self.f;
+        let x = list(r).clone();
+        let n = f.major;
+        for i in 0..n {
+            let s = x[i];
+            for p in f.ptr[i]..self.diag[i] { s -= f.val[p] * x[f.idx[p]]; }
+            x[i] = s;
+        }
+        for t in 0..n {
+            let i = n - 1 - t;
+            let s = x[i];
+            for p in self.diag[i] + 1..f.ptr[i + 1] { s -= f.val[p] * x[f.idx[p]]; }
+            x[i] = s / f.val[self.diag[i]];
+        }
+        vector(x)
+    }
+}
+
+/// `A ~ L L^T` on the pattern of the lower triangle of a symmetric `A`.
+/// See `ic0`.
+#[derive(Clone)]
+pub struct Ic0 {
+    /// Rows of `L`, the diagonal last in each.
+    pub(pkg) l: Cs;
+}
+
+/// The IC(0) preconditioner of a symmetric positive definite `a` (only
+/// the lower triangle is read), for `cg`. A pivot that is not positive
+/// throws `NotPositiveDefinite`; IC(0) can fail on an SPD matrix that is
+/// not diagonally dominant, so then use `Jacobi` or `ilu0`.
+///
+/// ```nabi
+/// let t = try sparse::diags([[2.0], [-1.0], [-1.0]], [0, 1, -1], [200, 200]);
+/// let plain = try sparse::cg(t, List::filled(200, 1.0));
+/// let pre = try sparse::cg(t, List::filled(200, 1.0), pre: try sparse::ic0(t));
+/// assert(pre.iterations < plain.iterations);
+/// ```
+pub fn ic0<S: Sparse>(a: S) throws (SparseError) -> Ic0 {
+    let c = a.as_csr();
+    let s = c.shape();
+    try pkg::error::square(s[0], s[1]);
+    let n = s[0];
+    // The lower triangle, row by row, diagonal last.
+    let ptr = List::filled(n + 1, 0usize);
+    let idx: List<usize> = [];
+    let val: List<f64> = [];
+    for i in 0..n {
+        let has = false;
+        for p in c.s.ptr[i]..c.s.ptr[i + 1] {
+            let j = c.s.idx[p];
+            if j <= i {
+                idx.push(j);
+                val.push(c.s.val[p]);
+                if j == i { has = true; }
+            }
+        }
+        if !has { throw SparseError::NotPositiveDefinite { column: i }; }
+        ptr[i + 1] = idx.len();
+    }
+    let at = List::filled(n, usize::MAX);
+    for i in 0..n {
+        let (lo, hi) = (ptr[i], ptr[i + 1]);
+        for p in lo..hi { at[idx[p]] = p; }
+        let d = val[hi - 1];
+        for p in lo..hi - 1 {
+            let k = idx[p];
+            // l_ik = (a_ik - sum_{j < k} l_ij l_kj) / l_kk
+            let v = val[p];
+            for q in ptr[k]..ptr[k + 1] - 1 {
+                let w = at[idx[q]];
+                if w != usize::MAX && w < p { v -= val[w] * val[q]; }
+            }
+            v /= val[ptr[k + 1] - 1];
+            val[p] = v;
+            d -= v * v;
+        }
+        for p in lo..hi { at[idx[p]] = usize::MAX; }
+        if !(d > 0.0) { throw SparseError::NotPositiveDefinite { column: i }; }
+        val[hi - 1] = d.sqrt();
+    }
+    Ic0 { l: Cs { major: n, minor: n, ptr, idx, val } }
+}
+
+impl Preconditioner for Ic0 {
+    fn precondition(self, r: Vector<f64>) -> Vector<f64> {
+        let l = self.l;
+        let x = list(r).clone();
+        let n = l.major;
+        for i in 0..n {
+            let s = x[i];
+            let e = l.ptr[i + 1] - 1;
+            for p in l.ptr[i]..e { s -= l.val[p] * x[l.idx[p]]; }
+            x[i] = s / l.val[e];
+        }
+        for t in 0..n {
+            let i = n - 1 - t;
+            let e = l.ptr[i + 1] - 1;
+            x[i] /= l.val[e];
+            let xi = x[i];
+            for p in l.ptr[i]..e { x[l.idx[p]] -= l.val[p] * xi; }
+        }
+        vector(x)
+    }
+}

@@ -1,0 +1,82 @@
+//! The one error type of the package. Each message says what went wrong
+//! and what to call instead.
+
+/// What went wrong in a sparse call.
+///
+/// ```nabi
+/// use sparse::SparseError;
+///
+/// let a = try sparse::diags([[1.0, 0.0]], [0], [2, 2]);
+/// let e = try {
+///     _ = try sparse::lu(a);
+///     SparseError::NotFinite
+/// } catch e: SparseError { e };
+/// assert(e == SparseError::Singular { column: 1 });
+/// assert(f"{e}".contains("lstsq"));
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub enum SparseError {
+    /// The operands' shapes do not fit; `what` names both.
+    ShapeMismatch { what: str; },
+    /// A row or column index is outside the shape.
+    OutOfBounds { what: str; },
+    /// Compressed arrays that do not describe a matrix: `what` says
+    /// which rule they break.
+    BadStructure { what: str; },
+    /// A square matrix was needed.
+    NotSquare { rows: usize; cols: usize; },
+    /// A symmetric matrix was needed; `(row, col)` differs from its
+    /// mirror.
+    NotSymmetric { row: usize; col: usize; },
+    /// No usable pivot in `column` (0-based, in elimination order): the
+    /// matrix is singular, or numerically so.
+    Singular { column: usize; },
+    /// A pivot that is not positive in `column` (0-based, in elimination
+    /// order): the matrix is not positive definite.
+    NotPositiveDefinite { column: usize; },
+    /// An iterative solver stopped after `iterations` steps with the
+    /// residual norm `residual` above the tolerance.
+    NoConvergence { iterations: usize; residual: f64; },
+    /// An iterative solver divided by zero after `iterations` steps;
+    /// `what` names the quantity.
+    Breakdown { iterations: usize; what: str; },
+    /// The input holds NaN or an infinity.
+    NotFinite,
+}
+
+impl Display for SparseError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            SparseError::ShapeMismatch { what } => f"shapes do not fit: {what}",
+            SparseError::OutOfBounds { what } => f"index out of bounds: {what}; check the shape passed with the indices",
+            SparseError::BadStructure { what } => f"not a valid compressed matrix: {what}; build it with `from_triplets` instead",
+            SparseError::NotSquare { rows, cols } => f"expected a square matrix, got {rows} x {cols}; use `gmres` on the normal equations or `linalg::lstsq` on `a.to_dense()`",
+            SparseError::NotSymmetric { row, col } => f"matrix is not symmetric (entry ({row}, {col}) differs from ({col}, {row})); use `lu` or `gmres` for a matrix that is not",
+            SparseError::Singular { column } => f"matrix is singular (no nonzero pivot in column {column}); use `linalg::lstsq` on `a.to_dense()` for a least-squares answer",
+            SparseError::NotPositiveDefinite { column } => f"matrix is not positive definite (pivot {column} is not positive); use `lu`, `gmres` or `bicgstab` for a matrix that is not",
+            SparseError::NoConvergence { iterations, residual } => f"no convergence after {iterations} iterations (residual {residual:e}); pass a preconditioner (`pre: sparse::ilu0(a)`), raise `max_iter`, or use `lu`",
+            SparseError::Breakdown { iterations, what } => f"solver broke down after {iterations} iterations ({what} is zero); use `gmres`, which does not break down, or `lu`",
+            SparseError::NotFinite => "input holds NaN or infinity; replace them first",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl Error for SparseError {}
+
+/// `NotSquare` unless `r == c`.
+pub(pkg) fn square(r: usize, c: usize) throws (SparseError) {
+    if r != c { throw SparseError::NotSquare { rows: r, cols: c }; }
+}
+
+/// `ShapeMismatch` naming `op` and both operands.
+pub(pkg) fn mismatch(op: str, a: str, b: str) -> SparseError {
+    SparseError::ShapeMismatch { what: f"{op} of {a} and {b}" }
+}
+
+/// `NotFinite` unless every element of `xs` is finite.
+pub(pkg) fn finite(xs: List<f64>) throws (SparseError) {
+    for i in 0..xs.len() {
+        if !xs[i].is_finite() { throw SparseError::NotFinite; }
+    }
+}

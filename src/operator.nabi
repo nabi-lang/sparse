@@ -1,0 +1,70 @@
+//! `Operator`: anything the iterative solvers can multiply by, so a
+//! matrix never formed (a stencil, a product of factors) works too.
+
+use pkg::csr::vector;
+use pkg::kernel::list;
+use pkg::{Csc, Csr};
+use core::array::{Matrix, Vector};
+
+/// A linear map `x -> A x` of `dims()` (`[rows, cols]`): `Csr`, `Csc`,
+/// a dense `Matrix<f64>`, or a function wrapped by `operator`.
+///
+/// ```nabi
+/// use sparse::Operator;
+/// use core::array::Vector;
+///
+/// let a = sparse::eye(2).scale(2.0);
+/// let x: Vector<f64> = [1, 3];
+/// assert(a.dims() == [2, 2] && a.apply(x).to_list() == [2.0, 6.0]);
+/// ```
+pub trait Operator {
+    /// `[rows, cols]`.
+    fn dims(self) -> [usize; 2];
+    /// `A x`, for `x` of length `cols`.
+    fn apply(self, x: Vector<f64>) -> Vector<f64>;
+}
+
+impl Operator for Csr {
+    fn dims(self) -> [usize; 2] { self.shape() }
+    fn apply(self, x: Vector<f64>) -> Vector<f64> { vector(self.s.gather(list(x))) }
+}
+
+impl Operator for Csc {
+    fn dims(self) -> [usize; 2] { self.shape() }
+    fn apply(self, x: Vector<f64>) -> Vector<f64> { vector(self.s.scatter(list(x))) }
+}
+
+impl Operator for Matrix<f64> {
+    fn dims(self) -> [usize; 2] { self.shape() }
+    fn apply(self, x: Vector<f64>) -> Vector<f64> { try! linalg::matvec(self, x) }
+}
+
+/// A matrix-free `n x n` operator: `f(x)` is `A x`. See `operator`.
+pub struct FnOperator {
+    pub(pkg) n: usize;
+    pub(pkg) f: fn(Vector<f64>) -> Vector<f64>;
+}
+
+impl Operator for FnOperator {
+    fn dims(self) -> [usize; 2] { [self.n, self.n] }
+    fn apply(self, x: Vector<f64>) -> Vector<f64> { (self.f)(x) }
+}
+
+/// The `n x n` operator `x -> f(x)`, for the iterative solvers when `A`
+/// is cheaper to apply than to store.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// // The 1-d Laplacian as a stencil.
+/// let n = 50;
+/// let lap = sparse::operator(n, |x: Vector<f64>| -> Vector<f64> {
+///     Vector::<f64>::from_fn([n], |i: [usize; 1]| -> f64 {
+///         let k = i[0];
+///         2.0 * x[k] - (if k > 0 { x[k - 1] } else { 0.0 }) - (if k + 1 < n { x[k + 1] } else { 0.0 })
+///     })
+/// });
+/// let s = try sparse::cg(lap, Vector::<f64>::ones([n]));
+/// assert(s.residual < 1e-6);
+/// ```
+pub fn operator(n: usize, f: fn(Vector<f64>) -> Vector<f64>) -> FnOperator { FnOperator { n, f } }

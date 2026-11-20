@@ -1,0 +1,86 @@
+//! `+`, `-`, unary `-` and `*` by a scalar on `Csr` and `Csc`. Operators
+//! cannot throw, so a shape mismatch panics, naming both shapes; the
+//! methods `add` and `sub` throw instead.
+
+use pkg::compress::Cs;
+use pkg::{Csc, Csr};
+
+#[track_caller]
+fn fit(op: str, a: [usize; 2], b: [usize; 2]) {
+    if a != b { panic(f"{op}: {a[0]} x {a[1]} and {b[0]} x {b[1]} do not fit; the shapes must be equal"); }
+}
+
+fn sum(a: Cs, b: Cs, s: f64) -> Cs { a.combine(1.0, b, s) }
+
+/// `a + b`.
+///
+/// ```nabi
+/// let a = sparse::eye(2);
+/// assert((a + a).get(0, 0) == 2.0 && (a - a).get(1, 1) == 0.0);
+/// assert((-a).get(0, 0) == -1.0 && (a * 3.0).get(1, 1) == 3.0 && (2.0 * a).get(0, 0) == 2.0);
+/// ```
+impl ops::Add for Csr {
+    type Output = Csr;
+    #[track_caller]
+    fn add(self, rhs: Csr) -> Csr {
+        fit("+", self.shape(), rhs.shape());
+        Csr { s: sum(self.s, rhs.s, 1.0) }
+    }
+}
+
+impl ops::Sub for Csr {
+    type Output = Csr;
+    #[track_caller]
+    fn sub(self, rhs: Csr) -> Csr {
+        fit("-", self.shape(), rhs.shape());
+        Csr { s: sum(self.s, rhs.s, -1.0) }
+    }
+}
+
+impl ops::Neg for Csr {
+    type Output = Csr;
+    fn neg(self) -> Csr { self.scale(-1.0) }
+}
+
+impl ops::Mul<f64> for Csr {
+    type Output = Csr;
+    fn mul(self, rhs: f64) -> Csr { self.scale(rhs) }
+}
+
+impl ops::Mul<Csr> for f64 {
+    type Output = Csr;
+    fn mul(self, rhs: Csr) -> Csr { rhs.scale(self) }
+}
+
+impl ops::Add for Csc {
+    type Output = Csc;
+    #[track_caller]
+    fn add(self, rhs: Csc) -> Csc {
+        fit("+", self.shape(), rhs.shape());
+        Csc { s: sum(self.s, rhs.s, 1.0) }
+    }
+}
+
+impl ops::Sub for Csc {
+    type Output = Csc;
+    #[track_caller]
+    fn sub(self, rhs: Csc) -> Csc {
+        fit("-", self.shape(), rhs.shape());
+        Csc { s: sum(self.s, rhs.s, -1.0) }
+    }
+}
+
+impl ops::Neg for Csc {
+    type Output = Csc;
+    fn neg(self) -> Csc { self.scale(-1.0) }
+}
+
+impl ops::Mul<f64> for Csc {
+    type Output = Csc;
+    fn mul(self, rhs: f64) -> Csc { self.scale(rhs) }
+}
+
+impl ops::Mul<Csc> for f64 {
+    type Output = Csc;
+    fn mul(self, rhs: Csc) -> Csc { rhs.scale(self) }
+}

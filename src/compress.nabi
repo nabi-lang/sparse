@@ -1,0 +1,354 @@
+//! The compressed storage `Csr` and `Csc` share: `major` slices (rows of
+//! a CSR, columns of a CSC) of `(minor index, value)` pairs, minor
+//! indices rising strictly in each slice. A CSR's arrays read as a CSC
+//! are its transpose, so one set of kernels serves both.
+
+use pkg::SparseError;
+use pkg::error::mismatch;
+use core::range::Range;
+
+/// `ptr[k]..ptr[k + 1]` is slice `k` of `idx` and `val`.
+#[derive(Clone)]
+pub(pkg) struct Cs {
+    pub(pkg) major: usize;
+    pub(pkg) minor: usize;
+    pub(pkg) ptr: List<usize>;
+    pub(pkg) idx: List<usize>;
+    pub(pkg) val: List<f64>;
+}
+
+impl Cs {
+    pub(pkg) fn nnz(self) -> usize { self.ptr[self.major] }
+
+    /// The value at `(k, j)` (major, minor), 0 when not stored. Binary
+    /// search in slice `k`.
+    pub(pkg) fn get(self, k: usize, j: usize) -> f64 {
+        let (lo, hi) = (self.ptr[k], self.ptr[k + 1]);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let c = self.idx[mid];
+            if c == j { return self.val[mid]; }
+            if c < j { lo = mid + 1; } else { hi = mid; }
+        }
+        0.0
+    }
+
+    /// The other orientation: slice `j` of the result holds the entries
+    /// of minor index `j`, sorted by major index. Counting sort, O(nnz +
+    /// major + minor).
+    pub(pkg) fn transpose(self) -> Cs {
+        let nz = self.nnz();
+        let ptr = List::filled(self.minor + 1, 0usize);
+        for p in 0..nz { ptr[self.idx[p] + 1] += 1; }
+        for j in 0..self.minor { ptr[j + 1] += ptr[j]; }
+        let next = ptr.clone();
+        let idx = List::filled(nz, 0usize);
+        let val = List::filled(nz, 0.0);
+        for k in 0..self.major {
+            for p in self.ptr[k]..self.ptr[k + 1] {
+                let j = self.idx[p];
+                let q = next[j];
+                next[j] = q + 1;
+                idx[q] = k;
+                val[q] = self.val[p];
+            }
+        }
+        Cs { major: self.minor, minor: self.major, ptr, idx, val }
+    }
+
+    /// From triplets in any order, duplicates summed. Two counting sorts
+    /// (by minor, then stably by major) leave each slice sorted.
+    pub(pkg) fn from_triplets(major: usize, minor: usize, maj: List<usize>, min: List<usize>, val: List<f64>) throws (SparseError) -> Cs {
+        let n = maj.len();
+        if min.len() != n || val.len() != n {
+            throw SparseError::ShapeMismatch { what: f"triplets of {maj.len()} rows, {min.len()} columns and {val.len()} values; pass one row, column and value per entry" };
+        }
+        for p in 0..n {
+            if maj[p] >= major || min[p] >= minor {
+                throw SparseError::OutOfBounds { what: f"entry {p} at ({maj[p]}, {min[p]}) in a {major} x {minor} matrix" };
+            }
+        }
+        // By minor first: slice j of `t` holds the entries of minor j in
+        // input order; its transpose is sorted by (major, minor).
+        let ptr = List::filled(minor + 1, 0usize);
+        for p in 0..n { ptr[min[p] + 1] += 1; }
+        for j in 0..minor { ptr[j + 1] += ptr[j]; }
+        let next = ptr.clone();
+        let idx = List::filled(n, 0usize);
+        let vs = List::filled(n, 0.0);
+        for p in 0..n {
+            let q = next[min[p]];
+            next[min[p]] = q + 1;
+            idx[q] = maj[p];
+            vs[q] = val[p];
+        }
+        let t = Cs { major: minor, minor: major, ptr, idx, val: vs };
+        t.transpose().summed()
+    }
+
+    /// Sorted slices with neighbours of equal index merged by summing.
+    pub(pkg) fn summed(self) -> Cs {
+        let ptr = List::filled(self.major + 1, 0usize);
+        let idx: List<usize> = List::with_capacity(self.nnz());
+        let val: List<f64> = List::with_capacity(self.nnz());
+        for k in 0..self.major {
+            let start = idx.len();
+            for p in self.ptr[k]..self.ptr[k + 1] {
+                let j = self.idx[p];
+                if idx.len() > start && idx[idx.len() - 1] == j {
+                    val[val.len() - 1] += self.val[p];
+                } else {
+                    idx.push(j);
+                    val.push(self.val[p]);
+                }
+            }
+            ptr[k + 1] = idx.len();
+        }
+        Cs { major: self.major, minor: self.minor, ptr, idx, val }
+    }
+
+    /// Checked compressed arrays; slices out of order or with repeated
+    /// indices are sorted and summed.
+    pub(pkg) fn checked(major: usize, minor: usize, ptr: List<usize>, idx: List<usize>, val: List<f64>) throws (SparseError) -> Cs {
+        if ptr.len() != major + 1 {
+            throw SparseError::BadStructure { what: f"{ptr.len()} pointers for {major} slices; pass one more pointer than slices" };
+        }
+        if ptr[0] != 0 { throw SparseError::BadStructure { what: "the first pointer must be 0" }; }
+        for k in 0..major {
+            if ptr[k + 1] < ptr[k] { throw SparseError::BadStructure { what: f"pointer {k + 1} is below pointer {k}" }; }
+        }
+        let nz = ptr[major];
+        if idx.len() != nz || val.len() != nz {
+            throw SparseError::BadStructure { what: f"the last pointer is {nz}, with {idx.len()} indices and {val.len()} values" };
+        }
+        let sorted = true;
+        for k in 0..major {
+            for p in ptr[k]..ptr[k + 1] {
+                if idx[p] >= minor { throw SparseError::OutOfBounds { what: f"index {idx[p]} in slice {k}, of {minor}" }; }
+                if p > ptr[k] && idx[p] <= idx[p - 1] { sorted = false; }
+            }
+        }
+        let s = Cs { major, minor, ptr: ptr.clone(), idx: idx.clone(), val: val.clone() };
+        if sorted { s } else { s.transpose().transpose().summed() }
+    }
+
+    /// `y = S x` for row-major `S`: one dot product per slice.
+    pub(pkg) fn gather(self, x: List<f64>) -> List<f64> {
+        let y = List::filled(self.major, 0.0);
+        for k in 0..self.major {
+            let s = 0.0;
+            for p in self.ptr[k]..self.ptr[k + 1] { s += self.val[p] * x[self.idx[p]]; }
+            y[k] = s;
+        }
+        y
+    }
+
+    /// `y = S^T x` for row-major `S` (so `S x` for column-major): each
+    /// slice scattered into `y`.
+    pub(pkg) fn scatter(self, x: List<f64>) -> List<f64> {
+        let y = List::filled(self.minor, 0.0);
+        for k in 0..self.major {
+            let xk = x[k];
+            if xk == 0.0 { continue; }
+            for p in self.ptr[k]..self.ptr[k + 1] { y[self.idx[p]] += self.val[p] * xk; }
+        }
+        y
+    }
+
+    /// The dense row-major elements (`row_major` false: of the
+    /// transpose).
+    pub(pkg) fn dense(self, row_major: bool) -> List<f64> {
+        let out = List::filled(self.major * self.minor, 0.0);
+        for k in 0..self.major {
+            for p in self.ptr[k]..self.ptr[k + 1] {
+                let j = self.idx[p];
+                if row_major { out[k * self.minor + j] += self.val[p]; } else { out[j * self.major + k] += self.val[p]; }
+            }
+        }
+        out
+    }
+
+    /// From dense row-major elements of `rows x cols`: entries with
+    /// `|x| > drop`.
+    pub(pkg) fn of_dense(xs: List<f64>, rows: usize, cols: usize, drop: f64) -> Cs {
+        let ptr = List::filled(rows + 1, 0usize);
+        let idx: List<usize> = [];
+        let val: List<f64> = [];
+        for i in 0..rows {
+            for j in 0..cols {
+                let x = xs[i * cols + j];
+                if !(x.abs() <= drop) {
+                    idx.push(j);
+                    val.push(x);
+                }
+            }
+            ptr[i + 1] = idx.len();
+        }
+        Cs { major: rows, minor: cols, ptr, idx, val }
+    }
+
+    /// The slices `r`, sharing nothing.
+    pub(pkg) fn slices(self, r: Range<usize>) throws (SparseError) -> Cs {
+        if r.start > r.end || r.end > self.major {
+            throw SparseError::OutOfBounds { what: f"slices {r.start}..{r.end} of {self.major}" };
+        }
+        let base = self.ptr[r.start];
+        let n = r.end - r.start;
+        let ptr = List::from_fn(n + 1, |k| self.ptr[r.start + k] - base);
+        let e = self.ptr[r.end];
+        let idx = List::from_fn(e - base, |p| self.idx[base + p]);
+        let val = List::from_fn(e - base, |p| self.val[base + p]);
+        Cs { major: n, minor: self.minor, ptr, idx, val }
+    }
+
+    /// The minor indices `r` of every slice, renumbered from 0.
+    pub(pkg) fn within(self, r: Range<usize>) throws (SparseError) -> Cs {
+        if r.start > r.end || r.end > self.minor {
+            throw SparseError::OutOfBounds { what: f"indices {r.start}..{r.end} of {self.minor}" };
+        }
+        let ptr = List::filled(self.major + 1, 0usize);
+        let idx: List<usize> = [];
+        let val: List<f64> = [];
+        for k in 0..self.major {
+            for p in self.ptr[k]..self.ptr[k + 1] {
+                let j = self.idx[p];
+                if j >= r.start && j < r.end {
+                    idx.push(j - r.start);
+                    val.push(self.val[p]);
+                }
+            }
+            ptr[k + 1] = idx.len();
+        }
+        Cs { major: self.major, minor: r.end - r.start, ptr, idx, val }
+    }
+
+    /// `a S + b T` (same shapes): a merge of the sorted slices.
+    pub(pkg) fn combine(self, a: f64, t: Cs, b: f64) -> Cs {
+        let ptr = List::filled(self.major + 1, 0usize);
+        let idx: List<usize> = List::with_capacity(self.nnz() + t.nnz());
+        let val: List<f64> = List::with_capacity(self.nnz() + t.nnz());
+        for k in 0..self.major {
+            let (p, pe) = (self.ptr[k], self.ptr[k + 1]);
+            let (q, qe) = (t.ptr[k], t.ptr[k + 1]);
+            while p < pe || q < qe {
+                let i = if p < pe { self.idx[p] } else { usize::MAX };
+                let j = if q < qe { t.idx[q] } else { usize::MAX };
+                if i < j {
+                    idx.push(i);
+                    val.push(a * self.val[p]);
+                    p += 1;
+                } else if j < i {
+                    idx.push(j);
+                    val.push(b * t.val[q]);
+                    q += 1;
+                } else {
+                    idx.push(i);
+                    val.push(a * self.val[p] + b * t.val[q]);
+                    p += 1;
+                    q += 1;
+                }
+            }
+            ptr[k + 1] = idx.len();
+        }
+        Cs { major: self.major, minor: self.minor, ptr, idx, val }
+    }
+
+    /// `s S`.
+    pub(pkg) fn scaled(self, s: f64) -> Cs {
+        let val = List::from_fn(self.val.len(), |p| s * self.val[p]);
+        Cs { major: self.major, minor: self.minor, ptr: self.ptr, idx: self.idx, val }
+    }
+
+    /// `S T` for row-major `S` and `T`: Gustavson's row-by-row product
+    /// with a dense accumulator; each row's indices sorted. O(flops +
+    /// nnz log).
+    pub(pkg) fn product(self, t: Cs) -> Cs {
+        let n = t.minor;
+        let acc = List::filled(n, 0.0);
+        let mark = List::filled(n, usize::MAX);
+        let ptr = List::filled(self.major + 1, 0usize);
+        let idx: List<usize> = [];
+        let val: List<f64> = [];
+        let row: List<usize> = [];
+        for i in 0..self.major {
+            row.clear();
+            for p in self.ptr[i]..self.ptr[i + 1] {
+                let k = self.idx[p];
+                let a = self.val[p];
+                for q in t.ptr[k]..t.ptr[k + 1] {
+                    let j = t.idx[q];
+                    if mark[j] != i {
+                        mark[j] = i;
+                        acc[j] = 0.0;
+                        row.push(j);
+                    }
+                    acc[j] += a * t.val[q];
+                }
+            }
+            row.sort();
+            for j in row {
+                idx.push(j);
+                val.push(acc[j]);
+            }
+            ptr[i + 1] = idx.len();
+        }
+        Cs { major: self.major, minor: n, ptr, idx, val }
+    }
+
+    /// The main diagonal of a row-major `S` (or column-major: the same).
+    pub(pkg) fn diagonal(self) -> List<f64> {
+        let n = self.major.min(self.minor);
+        List::from_fn(n, |k| self.get(k, k))
+    }
+
+    /// Whether every slice is sorted with the minor index `k` stored in
+    /// slice `k` (a stored diagonal); the position of each diagonal.
+    pub(pkg) fn diagonal_at(self) throws (SparseError) -> List<usize> {
+        let at = List::filled(self.major, 0usize);
+        for k in 0..self.major {
+            let found = false;
+            for p in self.ptr[k]..self.ptr[k + 1] {
+                if self.idx[p] == k {
+                    at[k] = p;
+                    found = true;
+                }
+            }
+            if !found || self.val[at[k]] == 0.0 { throw SparseError::Singular { column: k }; }
+        }
+        at
+    }
+
+    /// Whether `self` equals its transpose up to `rel` (relative to the
+    /// largest magnitude); the first offending pair if not.
+    pub(pkg) fn asymmetry(self) -> (usize, usize) | none {
+        let t = self.transpose();
+        let big = 0.0;
+        for p in 0..self.val.len() { big = big.max(self.val[p].abs()); }
+        let tol = 1e-12 * big;
+        for k in 0..self.major {
+            let (p, pe) = (self.ptr[k], self.ptr[k + 1]);
+            let (q, qe) = (t.ptr[k], t.ptr[k + 1]);
+            while p < pe || q < qe {
+                let i = if p < pe { self.idx[p] } else { usize::MAX };
+                let j = if q < qe { t.idx[q] } else { usize::MAX };
+                if i < j {
+                    if self.val[p].abs() > tol { return (k, i); }
+                    p += 1;
+                } else if j < i {
+                    if t.val[q].abs() > tol { return (k, j); }
+                    q += 1;
+                } else {
+                    if (self.val[p] - t.val[q]).abs() > tol { return (k, i); }
+                    p += 1;
+                    q += 1;
+                }
+            }
+        }
+        none
+    }
+}
+
+/// `ShapeMismatch` unless two shapes are equal.
+pub(pkg) fn same(op: str, a: [usize; 2], b: [usize; 2]) throws (SparseError) {
+    if a != b { throw mismatch(op, f"{a[0]} x {a[1]}", f"{b[0]} x {b[1]}"); }
+}
