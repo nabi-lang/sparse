@@ -8,6 +8,93 @@
 //! throw and panic on a shape mismatch as core's do.
 //!
 //! Pure Nabi, so every target, wasm included, gets the same results.
+//!
+//! ## Tutorial
+//!
+//! A matrix with a million rows does not fit in memory as a dense array,
+//! but most such matrices are almost all zeros: each unknown couples to a
+//! few neighbours. `sparse` stores only the nonzeros. It works on core's
+//! `Vector<f64>` ([Arrays and
+//! numerics](https://docs.nabi-lang.org/latest/learn/21-arrays-and-numerics.html)),
+//! like [`linalg`](https://packages.nabi-lang.org/docs/linalg/latest),
+//! which handles dense matrices and whose tutorial covers solving, least
+//! squares and eigenvalues.
+//!
+//! ### Sparse matrices
+//!
+//! Build a matrix from (row, column, value) triplets with `Coo`, then
+//! convert it to `Csr` for arithmetic and solving.
+//!
+//! ```nabi
+//! let c = sparse::Coo::new([4, 4]);
+//! for i in 0..4 {
+//!     try c.push(i, i, 4.0);
+//!     if i + 1 < 4 {
+//!         try c.push(i, i + 1, -1.0);
+//!         try c.push(i + 1, i, -1.0);
+//!     }
+//! }
+//! let a = c.to_csr();
+//! println(f"{a.nnz()} nonzeros in a {a.shape():?} matrix");
+//! println(try a.matvec([1, 1, 1, 1]));
+//! # assert(a.nnz() == 10);
+//! # assert((try a.matvec([1, 1, 1, 1])).to_list() == [3.0, 2.0, 2.0, 3.0]);
+//! ```
+//!
+//! ```text
+//! 10 nonzeros in a [4, 4] matrix
+//! [3.0, 2.0, 2.0, 3.0]
+//! ```
+//!
+//! ### Solve a large sparse system
+//!
+//! The heat equation on a square plate, discretized on a 100 x 100 grid,
+//! gives 10 000 unknowns and a matrix with five nonzeros per row.
+//! `sparse::diags` builds the one-dimensional difference matrix from its
+//! diagonals, and `kron` combines two of them into the two-dimensional one.
+//! `sparse::cg` solves it iteratively with conjugate gradients; `ic0` (an
+//! incomplete Cholesky factorization) cuts the number of iterations.
+//!
+//! ```nabi
+//! use core::array::Vector;
+//!
+//! let n = 100;
+//! let t = try sparse::diags([[2.0], [-1.0], [-1.0]], [0, 1, -1], [n, n]);
+//! let i = sparse::eye(n);
+//! let a = sparse::kron(i, t) + sparse::kron(t, i);
+//! let b = Vector::<f64>::ones([n * n]);
+//!
+//! let plain = try sparse::cg(a, b);
+//! let pre = try sparse::cg(a, b, pre: try sparse::ic0(a));
+//! println(f"{a.nnz()} nonzeros; cg {plain.iterations} iterations, with ic0 {pre.iterations}");
+//!
+//! let x = try (try sparse::cholesky(a)).solve(b);
+//! println(f"direct and iterative agree: {linalg::norm(x .- pre.x) / linalg::norm(x) < 1e-6}");
+//! println(f"hottest point {x.max() ?? 0.0:.2}");
+//! # assert(a.nnz() == 49600 && plain.iterations == 187 && pre.iterations == 79);
+//! # assert(linalg::norm(x .- pre.x) / linalg::norm(x) < 1e-6);
+//! # assert(((x.max() ?? 0.0) - 751.34).abs() < 0.005);
+//! ```
+//!
+//! ```text
+//! 49600 nonzeros; cg 187 iterations, with ic0 79
+//! direct and iterative agree: true
+//! hottest point 751.34
+//! ```
+//!
+//! The iterative solvers take a tolerance (`rtol:`), an iteration limit and
+//! any `Operator`, including a function that applies the matrix without
+//! storing it (`sparse::operator`). `sparse::cholesky` and `sparse::lu` are
+//! direct solvers that reorder the matrix to keep the factors sparse.
+//!
+//! ### What next
+//!
+//! - [`linalg`](https://packages.nabi-lang.org/docs/linalg/latest): dense
+//!   matrices, factorizations, least squares, eigenvalues and the SVD.
+//! - [`stats`](https://packages.nabi-lang.org/docs/stats/latest):
+//!   distributions, tests and regression.
+//! - The rest of this package: GMRES, BiCGSTAB and preconditioners.
+//!
 
 #[cfg(feature = "ops")]
 pub mod ops;
