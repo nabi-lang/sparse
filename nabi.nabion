@@ -1,6 +1,6 @@
 Package {
     name: "sparse",
-    version: "0.1.0",
+    version: "0.1.1",
     nabi_version: "0.1.0",
     toolchain: "0.1",
     description: "Sparse matrices on core arrays: CSR, CSC, COO, products, CG, GMRES, BiCGSTAB with preconditioners, sparse Cholesky and LU",

@@ -2,7 +2,13 @@
 
 All notable changes to this package. Versions follow semver, independent of the Nabi toolchain.
 
-## 0.1.0 (unreleased)
+## 0.1.1 (2026-11-22)
+
+- The crate docs open with a tutorial: building a matrix from triplets
+  and solving a large system with `cg`, `ic0` and `cholesky`. It moved
+  here from the Nabi docs site; each step is a doc test.
+
+## 0.1.0 (2026-11-21)
 
 First release.
 
