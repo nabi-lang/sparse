@@ -15,7 +15,7 @@ included.
 nabi add sparse
 ```
 
-Needs Nabi 0.1 or later.
+Needs Nabi 0.1.2 or later.
 
 ## Usage
 
@@ -122,7 +122,7 @@ here is exact minimum degree without AMD's supervariables and
 approximate degrees. On big 3-d problems pass `order: Order::Rcm` or use
 an iterative solver.
 
-## Not in 0.1.0
+## Not yet supported
 
 Complex or f32 values; AMD/COLAMD and nested dissection orderings;
 supernodal or multifrontal factorizations; eigenvalue solvers (Lanczos,
@@ -130,7 +130,7 @@ Arnoldi); MINRES and LSQR; block or parallel kernels.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/sparse/latest/docs
+https://docs.nabi-lang.org/packages/sparse/latest
 
 ## License
 
